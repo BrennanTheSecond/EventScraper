@@ -1,0 +1,34 @@
+{
+  "sources": [
+    {
+      "id": "events_vt",
+      "name": "Virginia Tech Events",
+      "url": "https://events.vt.edu/",
+      "type": "events_vt"
+    },
+    {
+      "id": "career_vt",
+      "name": "Virginia Tech Career Center",
+      "url": "https://career.vt.edu/events/",
+      "type": "career_vt"
+    },
+    {
+      "id": "gobblerconnect",
+      "name": "GobblerConnect",
+      "url": "https://gobblerconnect.vt.edu/events",
+      "type": "gobblerconnect"
+    },
+    {
+      "id": "news_notices",
+      "name": "Virginia Tech News - Notices",
+      "url": "https://news.vt.edu/notices.html",
+      "type": "news"
+    },
+    {
+      "id": "news_home",
+      "name": "Virginia Tech News",
+      "url": "https://news.vt.edu",
+      "type": "news"
+    }
+  ]
+}

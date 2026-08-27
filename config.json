@@ -1,0 +1,69 @@
+{
+  "models": {
+    "worker": {
+      "provider": "ollama",
+      "url": "http://localhost:11434",
+      "api_key_env": "OLLAMA_API_KEY",
+      "model": "gemma4:31b"
+    },
+    "judge1": {
+      "provider": "ollama",
+      "url": "http://localhost:11434",
+      "api_key_env": "OLLAMA_API_KEY",
+      "model": "muse-glimmer:30b"
+    },
+    "judge2": {
+      "provider": "ollama",
+      "url": "http://localhost:11434",
+      "api_key_env": "OLLAMA_API_KEY",
+      "model": "qwen3.8:27b"
+    }
+  },
+
+  "stages": {
+    "use_same_model_for_all": false,
+    "num_judges": 2,
+    "judge_thinking": {
+      "muse-glimmer:30b": false,
+      "qwen3.8:27b": false
+    }
+  },
+
+  "scraping": {
+    "mode": "builtin",
+    "http_timeout": 20,
+    "polite_delay": 0.5,
+    "evergreen_max_days": 60,
+    "gobblerconnect_page_size": 100,
+    "gobblerconnect_max_events": 600,
+    "event_detail_limit": 1800
+  },
+
+  "files": {
+    "interests": "interests.json",
+    "sources": "sources.json"
+  },
+
+  "ollama": {
+    "num_ctx": 32768,
+    "num_gpu": 0,
+    "num_thread": 10,
+    "model_unload_grace_seconds": 600,
+    "_note": "model_unload_grace_seconds: 0 seconds is ideal for paid/cloud model providers (no local process to unload); ~600 seconds (10 min) is good for Ollama unloading large local models."
+  },
+
+  "email": {
+    "sender_email": "quinlanbrennan@gmail.com",
+    "receiver_email": "quinlanbrennan@vt.edu",
+    "smtp_server": "smtp.gmail.com",
+    "smtp_port": 465,
+    "send_hour_start": 8,
+    "send_hour_end": 24
+  },
+
+  "report": {
+    "html_file_path": "/home/quinlanbrennan/event_reminders/vt_events_all.html",
+    "server_ip": "100.88.84.86",
+    "server_port": 6060
+  }
+}
