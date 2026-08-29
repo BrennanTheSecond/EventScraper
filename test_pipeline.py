@@ -109,12 +109,67 @@ def test_auto_matches():
 
 def test_permanent_errors():
     section("_is_permanent -- do not burn retries on an error that cannot resolve")
-    check("a model rejecting `think`",
-          vt._is_permanent(Exception('"granite4.1:8b" does not support thinking')))
     check("a bad API key", vt._is_permanent(Exception("invalid_api_key")))
     check("an unknown model", vt._is_permanent(Exception("model foo not found")))
     check("a rate limit IS retried", not vt._is_permanent(Exception("429 rate limit")))
     check("a timeout IS retried", not vt._is_permanent(Exception("Read timed out")))
+    check("a model with no reasoning mode is NOT treated as permanent",
+          not vt._is_permanent(Exception('"granite4.1:8b" does not support thinking')),
+          "OllamaProvider re-runs it without `think`, so it never gets this far")
+
+
+def test_thinking_fallback():
+    section("no reasoning mode -- run the model anyway, without thinking")
+    check("Ollama's rejection is recognised",
+          bool(vt._NO_THINKING_RE.search('"granite4.1:8b" does not support thinking')))
+    check("an unrelated failure is not mistaken for it",
+          not vt._NO_THINKING_RE.search("connection refused"))
+
+    calls = []
+
+    class FakeOllama:
+        """Rejects `think` once, the way Ollama does, then succeeds."""
+        def generate(self, **kwargs):
+            calls.append(dict(kwargs))
+            if "think" in kwargs:
+                raise RuntimeError('"fake:1b" does not support thinking')
+            return {"response": '{"ok":1}', "prompt_eval_count": 1, "eval_count": 1}
+
+    real_ollama, vt.ollama = vt.ollama, FakeOllama()
+    remembered = set(vt._NO_THINKING_MODELS)
+    vt._NO_THINKING_MODELS.clear()
+    try:
+        provider = vt.OllamaProvider({"provider": "ollama", "model": "fake:1b"})
+        out = provider.generate("hi", thinking=True)
+        check("the call still returns a usable reply", out == '{"ok":1}')
+        check("it retried without `think`", len(calls) == 2 and "think" not in calls[1])
+        check("the model is remembered", "fake:1b" in vt._NO_THINKING_MODELS)
+
+        provider.generate("hi again", thinking=True)
+        check("a later call never sends `think` at all",
+              len(calls) == 3 and "think" not in calls[2],
+              "so the failed request is paid once per model, not once per batch")
+
+        calls.clear()
+        vt._NO_THINKING_MODELS.clear()
+
+        class AlwaysFails(FakeOllama):
+            def generate(self, **kwargs):
+                calls.append(dict(kwargs))
+                raise RuntimeError("connection refused")
+
+        vt.ollama = AlwaysFails()
+        try:
+            vt.OllamaProvider({"provider": "ollama", "model": "fake:1b"}).generate(
+                "hi", thinking=True)
+            check("an unrelated error still propagates", False)
+        except RuntimeError as e:
+            check("an unrelated error still propagates", "connection refused" in str(e))
+        check("and is not retried as a thinking problem", len(calls) == 1)
+    finally:
+        vt.ollama = real_ollama
+        vt._NO_THINKING_MODELS.clear()
+        vt._NO_THINKING_MODELS.update(remembered)
 
 
 def test_week_filtering():
@@ -189,7 +244,8 @@ def test_criteria_normalization():
 
 if __name__ == "__main__":
     for test in (test_parse_classification, test_dedupe, test_auto_matches,
-                 test_permanent_errors, test_week_filtering, test_grouping,
+                 test_permanent_errors, test_thinking_fallback,
+                 test_week_filtering, test_grouping,
                  test_escaping, test_scrape_roundtrip, test_email_bodies,
                  test_criteria_normalization):
         test()

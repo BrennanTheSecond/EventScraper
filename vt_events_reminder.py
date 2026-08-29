@@ -844,12 +844,23 @@ class Provider:
         return f"{self.spec.get('provider', '?')}:{self.model}"
 
 
+# Models that turned out to have no reasoning mode. Ollama answers a request
+# carrying `think` for such a model with a 400 rather than ignoring the
+# parameter, so the first call for a given model discovers this and every later
+# one drops `think` up front instead of paying the failure again.
+_NO_THINKING_MODELS = set()
+_NO_THINKING_RE = re.compile(r"does not support thinking", re.I)
+
+
 class OllamaProvider(Provider):
     needs_unload_guard = True
 
     def generate(self, prompt, want_json=False, thinking=None, keep_loaded=False):
         if not ollama:
             raise ImportError("Ollama library not found. Run 'pip install ollama'")
+        if thinking is not None and self.model in _NO_THINKING_MODELS:
+            # Already known to have no reasoning mode -- run it plainly.
+            thinking = None
         wait_for_model_unload(self.model)
         options = {"num_ctx": NUM_CTX, "num_gpu": NUM_GPU, "num_thread": NUM_THREAD}
         if want_json:
@@ -873,7 +884,19 @@ class OllamaProvider(Provider):
             kwargs["format"] = "json"
         if thinking is not None:
             kwargs["think"] = thinking
-        response = ollama.generate(**kwargs)
+        try:
+            response = ollama.generate(**kwargs)
+        except Exception as e:
+            # A model with no reasoning mode is a fine model to use -- it just
+            # cannot be asked to reason. Drop `think` and run it, rather than
+            # failing the batch over a parameter the work never needed.
+            if thinking is None or not _NO_THINKING_RE.search(str(e)):
+                raise
+            _NO_THINKING_MODELS.add(self.model)
+            kwargs.pop("think", None)
+            _stamp(f"LOAD    '{self.model}' has no reasoning mode -- "
+                   f"re-running it without thinking")
+            response = ollama.generate(**kwargs)
         _stamp(f"DONE    '{self.model}' returned after "
                f"{(time.time() - started) / 60:.1f} min"
                + ("; staying loaded for the next batch" if keep_loaded
@@ -961,11 +984,14 @@ def _log_ollama_cost(model, response):
           f"{note} in {minutes:.1f} min")
 
 
-# Errors that a retry cannot fix: a rejected request shape, a missing model, a
-# bad key. Retrying these only delays the run and muddies the log.
+# Errors that a retry cannot fix: a missing model, a bad key, a refused
+# request. Retrying these only delays the run and muddies the log.
+#
+# "does not support thinking" is deliberately NOT here: OllamaProvider handles
+# it by re-running the model without `think`, so it never reaches this point.
 _PERMANENT_ERROR_RE = re.compile(
-    r"does not support|not found|invalid[_ ]api[_ ]key|authentication|"
-    r"unauthorized|permission denied|model .* does not exist", re.I)
+    r"not found|invalid[_ ]api[_ ]key|authentication|unauthorized|"
+    r"permission denied|model .* does not exist|does not exist", re.I)
 
 
 def _is_permanent(error):

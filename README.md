@@ -152,9 +152,16 @@ Each of `worker`, `judge1`, `judge2` is a dict:
   model call, with exponential backoff. Errors that a retry cannot fix (unknown
   model, bad API key, a model that rejects `think`) are detected and not
   retried.
-- **`model_thinking`** — Ollama reasoning on/off per model. A model **absent
-  from this map keeps Ollama's own default**, which is what makes models with no
-  reasoning mode work at all. `judge_thinking` is still read as an alias.
+- **`model_thinking`** — Ollama reasoning on/off per model. A model absent from
+  this map keeps Ollama's own default. `judge_thinking` is still read as an
+  alias.
+
+  You do not need to know which of your models support reasoning. Ollama
+  rejects a `think` request outright for a model that has none
+  (`400 "does not support thinking"`); the script catches that, **drops
+  `think` and runs the model anyway**, and remembers not to ask again this run.
+  So setting a model to `true` here is a preference, not an assertion — a model
+  that cannot reason simply runs without it instead of failing the batch.
 
 ### Scraping — `scraping` section
 
