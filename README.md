@@ -183,11 +183,17 @@ Each of `worker`, `judge1`, `judge2` is a dict:
   "num_gpu": 0,       // -1=all, 0=CPU-only, N=use N GPU layers
   "num_thread": 10,   // inference threads
   "model_unload_grace_seconds": 600,  // ceiling on the model-swap wait
-  "unload_poll_seconds": 10           // how often to check whether it is gone
+  "unload_poll_seconds": 10,          // how often to check whether it is gone
+  "keep_loaded_seconds": "10m"        // hold the model between batches of a stage
 }
 ```
 
 - `num_ctx`, `num_gpu`, and `num_thread` only apply to Ollama.
+- `keep_loaded_seconds` keeps a model in RAM **between batches of the same
+  stage**, then releases it on that stage's last batch. Measured on this box, a
+  cold load is 393 s of a 923 s batch — 43% of it — because Ollama mmaps lazily
+  and 19 GB faults in from disk during the first prefill. Without this, every
+  batch would pay that again.
 - `model_unload_grace_seconds` is now a **ceiling, not a fixed cost**. Every
   call passes `keep_alive=0`, so on a model swap the script polls `ollama ps`
   every `unload_poll_seconds` and continues as soon as the previous model has

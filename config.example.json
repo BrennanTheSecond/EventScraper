@@ -56,7 +56,8 @@
     "num_gpu": 0,
     "num_thread": 10,
     "model_unload_grace_seconds": 600,
-    "_note": "model_unload_grace_seconds: 0 seconds is ideal for paid/cloud model providers (no local process to unload); ~600 seconds (10 min) is good for Ollama unloading large local models."
+    "_note": "model_unload_grace_seconds: 0 seconds is ideal for paid/cloud model providers (no local process to unload); ~600 seconds (10 min) is good for Ollama unloading large local models.",
+    "keep_loaded_seconds": "10m"
   },
   "email": {
     "sender_email": "you@gmail.com",

@@ -140,7 +140,7 @@ def apply_config(cfg):
     global SEND_HOUR_START, SEND_HOUR_END
     global SMTP_SERVER, SMTP_PORT
     global INTEREST_CRITERIA
-    global MODEL_UNLOAD_GRACE_SECONDS, UNLOAD_POLL_SECONDS
+    global MODEL_UNLOAD_GRACE_SECONDS, UNLOAD_POLL_SECONDS, KEEP_LOADED_SECONDS
     global HTTP_TIMEOUT, POLITE_DELAY, EVERGREEN_MAX_DAYS, INCLUDE_UNDATED
     global OUTPUT_MODE, CLASSIFY_BATCH_SIZE, CLASSIFY_DETAIL_LIMIT
     global CALL_MAX_ATTEMPTS, CALL_BACKOFF_SECONDS, CLOUD_TIMEOUT, DEFAULT_MAX_TOKENS
@@ -192,6 +192,8 @@ def apply_config(cfg):
     # ~10 minutes is right for Ollama spinning large local models on/off disk.
     MODEL_UNLOAD_GRACE_SECONDS = ollama_cfg.get("model_unload_grace_seconds", 600)
     UNLOAD_POLL_SECONDS = float(ollama_cfg.get("unload_poll_seconds", 10))
+    # How long Ollama holds a model between batches of the same stage.
+    KEEP_LOADED_SECONDS = ollama_cfg.get("keep_loaded_seconds", "10m")
 
     SENDER_EMAIL = email["sender_email"]
     # receiver_email accepts a single address or a list of them.
@@ -835,7 +837,7 @@ class Provider:
         self.url = spec.get("url") or None
         self.max_tokens = int(spec.get("max_tokens") or DEFAULT_MAX_TOKENS)
 
-    def generate(self, prompt, want_json=False, thinking=None):
+    def generate(self, prompt, want_json=False, thinking=None, keep_loaded=False):
         raise NotImplementedError
 
     def __str__(self):
@@ -845,7 +847,7 @@ class Provider:
 class OllamaProvider(Provider):
     needs_unload_guard = True
 
-    def generate(self, prompt, want_json=False, thinking=None):
+    def generate(self, prompt, want_json=False, thinking=None, keep_loaded=False):
         if not ollama:
             raise ImportError("Ollama library not found. Run 'pip install ollama'")
         wait_for_model_unload(self.model)
@@ -858,14 +860,24 @@ class OllamaProvider(Provider):
                f"num_thread={NUM_THREAD}, think={thinking}, "
                f"prompt={len(prompt)} chars)")
         started = time.time()
-        kwargs = dict(model=self.model, prompt=prompt, options=options, keep_alive=0)
+        # keep_alive=0 evicts the model the moment the call returns. That is
+        # right between stages, but wrong between batches of the same stage:
+        # measured here, a cold load costs 393 s of the 923 s batch (prefill
+        # runs at 5.95 tok/s while 19 GB faults in from the SATA SSD, against
+        # 1.25 tok/s of actual decode). Paying that once per batch instead of
+        # once per stage would add ~13 min per reviewer for nothing.
+        keep_alive = KEEP_LOADED_SECONDS if keep_loaded else 0
+        kwargs = dict(model=self.model, prompt=prompt, options=options,
+                      keep_alive=keep_alive)
         if want_json:
             kwargs["format"] = "json"
         if thinking is not None:
             kwargs["think"] = thinking
         response = ollama.generate(**kwargs)
         _stamp(f"DONE    '{self.model}' returned after "
-               f"{(time.time() - started) / 60:.1f} min")
+               f"{(time.time() - started) / 60:.1f} min"
+               + ("; staying loaded for the next batch" if keep_loaded
+                  else "; model unloading (keep_alive=0)"))
         _log_ollama_cost(self.model, response)
         return response["response"]
 
@@ -873,7 +885,7 @@ class OllamaProvider(Provider):
 class OpenAIProvider(Provider):
     supports_concurrency = True
 
-    def generate(self, prompt, want_json=False, thinking=None):
+    def generate(self, prompt, want_json=False, thinking=None, keep_loaded=False):
         from openai import OpenAI
         client = OpenAI(base_url=self.url, api_key=_spec_api_key(self.spec),
                         timeout=CLOUD_TIMEOUT)
@@ -888,7 +900,7 @@ class OpenAIProvider(Provider):
 class AnthropicProvider(Provider):
     supports_concurrency = True
 
-    def generate(self, prompt, want_json=False, thinking=None):
+    def generate(self, prompt, want_json=False, thinking=None, keep_loaded=False):
         import anthropic
         client = anthropic.Anthropic(api_key=_spec_api_key(self.spec),
                                      base_url=self.url, timeout=CLOUD_TIMEOUT)
@@ -907,7 +919,7 @@ class AnthropicProvider(Provider):
 class GeminiProvider(Provider):
     supports_concurrency = True
 
-    def generate(self, prompt, want_json=False, thinking=None):
+    def generate(self, prompt, want_json=False, thinking=None, keep_loaded=False):
         from google import genai
         from google.genai import types
         client = genai.Client(api_key=_spec_api_key(self.spec))
@@ -960,7 +972,8 @@ def _is_permanent(error):
     return bool(_PERMANENT_ERROR_RE.search(str(error)))
 
 
-def call_model(provider, prompt, want_json=True, thinking=None, label=""):
+def call_model(provider, prompt, want_json=True, thinking=None, label="",
+               keep_loaded=False):
     """One model call with retry/backoff, returning raw text.
 
     Retries cover the transient cloud failures (429s, 5xx, dropped
@@ -973,7 +986,8 @@ def call_model(provider, prompt, want_json=True, thinking=None, label=""):
         try:
             _stamp(f"CALL    {provider} ({tag}) attempt {attempt}/"
                    f"{CALL_MAX_ATTEMPTS}, prompt={len(prompt)} chars")
-            return provider.generate(prompt, want_json=want_json, thinking=thinking)
+            return provider.generate(prompt, want_json=want_json,
+                                     thinking=thinking, keep_loaded=keep_loaded)
         except Exception as e:
             last_error = e
             print(f"  call failed ({type(e).__name__}: {e})")
@@ -1089,7 +1103,10 @@ def classify(events, provider, today, week_end, label):
         tag = f"{label} batch {batch_no}/{total}"
         try:
             raw = call_model(provider, prompt, want_json=True,
-                             thinking=_thinking_for(provider), label=tag)
+                             thinking=_thinking_for(provider), label=tag,
+                             # Hold the model in RAM until this reviewer's last
+                             # batch, then let it go so the next stage can load.
+                             keep_loaded=batch_no < total)
             parsed = _parse_classification(raw, len(batch), start)
         except Exception as e:
             print(f"[{tag}] failed ({e}). Skipping this batch.")
