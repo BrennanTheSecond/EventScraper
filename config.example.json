@@ -19,16 +19,20 @@
       "model": "qwen3.8:27b"
     }
   },
-
   "stages": {
     "use_same_model_for_all": false,
     "num_judges": 2,
     "judge_thinking": {
       "muse-glimmer:30b": false,
       "qwen3.8:27b": false
-    }
+    },
+    "call_max_attempts": 3,
+    "call_backoff_seconds": 5,
+    "classify_batch_size": 25,
+    "classify_detail_limit": 400,
+    "cloud_timeout_seconds": 180,
+    "max_tokens": 8192
   },
-
   "scraping": {
     "mode": "builtin",
     "http_timeout": 20,
@@ -36,14 +40,17 @@
     "evergreen_max_days": 60,
     "gobblerconnect_page_size": 100,
     "gobblerconnect_max_events": 600,
-    "event_detail_limit": 1800
+    "event_detail_limit": 1800,
+    "include_undated": true
   },
-
+  "output": {
+    "mode": "html+email",
+    "_note": "mode: \"html\" writes the report only, \"email\" sends the digest only, \"html+email\" does both."
+  },
   "files": {
     "interests": "interests.json",
     "sources": "sources.json"
   },
-
   "ollama": {
     "num_ctx": 32768,
     "num_gpu": 0,
@@ -51,19 +58,18 @@
     "model_unload_grace_seconds": 600,
     "_note": "model_unload_grace_seconds: 0 seconds is ideal for paid/cloud model providers (no local process to unload); ~600 seconds (10 min) is good for Ollama unloading large local models."
   },
-
   "email": {
-    "sender_email": "quinlanbrennan@gmail.com",
-    "receiver_email": "quinlanbrennan@vt.edu",
+    "sender_email": "you@gmail.com",
+    "receiver_email": "you@example.edu",
     "smtp_server": "smtp.gmail.com",
     "smtp_port": 465,
     "send_hour_start": 8,
     "send_hour_end": 24
   },
-
   "report": {
-    "html_file_path": "/home/quinlanbrennan/event_reminders/vt_events_all.html",
-    "server_ip": "100.88.84.86",
-    "server_port": 6060
+    "html_file_path": "./vt_events_all.html",
+    "server_ip": "",
+    "server_port": 6060,
+    "_note": "server_ip/server_port build the REPORT_URL linked from the email. Leave server_ip empty to link the local file path instead."
   }
 }
