@@ -78,6 +78,17 @@ python vt_events_reminder.py --no-llm --from-scrape scrape.json
 `--no-llm` implies `--dry-run`: no email is sent and the report is written
 beside the real one as `*_dryrun.html`.
 
+### Tests
+
+```bash
+python test_pipeline.py
+```
+
+No pytest, no network, no model. Covers the pure functions that turn untrusted
+input into decisions: parsing a model's reply, de-duplicating events across
+sources, week filtering, day grouping, HTML escaping, the scrape cache
+round-trip, and the digest bodies.
+
 ---
 
 ## Configuration
