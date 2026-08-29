@@ -1,8 +1,14 @@
 {
   "criteria": [
-    "Offers free food or free items",
+    {
+      "text": "Offers free food or free items",
+      "auto_match_flags": [
+        "FREE FOOD",
+        "FREE ITEMS / GIVEAWAYS"
+      ]
+    },
     "Career / job fairs or recruiting events",
-    "Events related to Fencing, the Air Force (USAF), Military / Cadets",
+    "Events related to Fencing (sport)",
     "Events related to Data Science, Data Engineering, AI, Python, or Machine Learning"
   ]
 }

@@ -6,7 +6,9 @@ import requests
 from bs4 import BeautifulSoup
 import smtplib
 import ssl
+from email.message import EmailMessage
 import json
+from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 
 try:
@@ -32,13 +34,17 @@ import time
 # file (via env var or --config on the command line) to override, e.g. for a
 # test environment.
 #
-# Every model stage (scraper, worker, judge1, judge2) is a dict with:
+# Every model stage (worker, judge1, judge2) is a dict with:
 #   provider : "ollama" | "gemini" | "claude" | "openai"
 #   url      : the endpoint the provider is reached at (you fill this in)
 #   api_key_env : name of the env var (in .env) holding this model's key
 #   model    : the model name to send
+#   max_tokens : optional per-stage reply cap (cloud providers)
 #
 # Ollama ignores api_key_env entirely -- only url + model matter.
+#
+# config.json itself is git-ignored (it holds real addresses and a server IP);
+# config.example.json is the tracked template.
 # ==========================================
 DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                    "config.json")
@@ -49,6 +55,29 @@ def _json_path(base_name, config_dir):
     if os.path.isabs(base_name):
         return base_name
     return os.path.join(config_dir, base_name)
+
+
+def _normalize_criteria(raw):
+    """Number the interest criteria and accept both shorthand and full form.
+
+    A criterion is either a plain string, or an object that can also claim
+    source facets outright:
+
+        "Career / job fairs or recruiting events"
+        {"text": "Offers free food", "auto_match_flags": ["FREE FOOD"]}
+
+    Numbering is what the classification prompt and its replies use, so the
+    model returns a couple of digits per event instead of restating criteria.
+    """
+    criteria = []
+    for n, item in enumerate(raw, 1):
+        if isinstance(item, str):
+            criteria.append({"n": n, "text": item, "auto_match_flags": []})
+        else:
+            criteria.append({"n": n,
+                             "text": item["text"],
+                             "auto_match_flags": list(item.get("auto_match_flags") or [])})
+    return criteria
 
 
 def load_config():
@@ -65,9 +94,10 @@ def load_config():
             cfg_path = sys.argv[flag + 1]
     if not os.path.exists(cfg_path):
         sys.exit(f"Config file not found: {cfg_path}\n"
-                 f"Set CONFIG_PATH (or copy config.json next to the script).")
+                 f"Copy config.example.json to config.json and edit it, or point "
+                 f"CONFIG_PATH / --config at another file.")
 
-    with open(cfg_path, "r") as fh:
+    with open(cfg_path, "r", encoding="utf-8") as fh:
         cfg = json.load(fh)
 
     # Secrets from .env next to the config (or wherever DOTENV_PATH points).
@@ -84,9 +114,9 @@ def load_config():
     interests_path = _json_path(files.get("interests", "interests.json"), config_dir)
     sources_path = _json_path(files.get("sources", "sources.json"), config_dir)
 
-    with open(interests_path, "r") as fh:
-        cfg["_interests"] = json.load(fh)["criteria"]
-    with open(sources_path, "r") as fh:
+    with open(interests_path, "r", encoding="utf-8") as fh:
+        cfg["_interests"] = _normalize_criteria(json.load(fh)["criteria"])
+    with open(sources_path, "r", encoding="utf-8") as fh:
         cfg["_sources"] = json.load(fh)["sources"]
 
     return cfg
@@ -101,17 +131,19 @@ def apply_config(cfg):
     scrape = cfg["scraping"]
     ollama_cfg = cfg.get("ollama", {})
 
-    global MODEL_SPECS, USE_SAME_MODEL, NUM_JUDGES, JUDGE_THINKING
+    global MODEL_SPECS, USE_SAME_MODEL, NUM_JUDGES, MODEL_THINKING
     global SCRAPE_MODE, SOURCES
     global WORKER_SPEC, JUDGE1_SPEC, JUDGE2_SPEC
     global NUM_CTX, NUM_GPU, NUM_THREAD
-    global SENDER_EMAIL, RECEIVER_EMAIL, PASSWORD
+    global SENDER_EMAIL, RECEIVER_EMAIL, RECIPIENTS, PASSWORD
     global HTML_FILE_PATH, REPORT_URL
     global SEND_HOUR_START, SEND_HOUR_END
     global SMTP_SERVER, SMTP_PORT
     global INTEREST_CRITERIA
-    global MODEL_UNLOAD_GRACE_SECONDS
-    global HTTP_TIMEOUT, POLITE_DELAY, EVERGREEN_MAX_DAYS
+    global MODEL_UNLOAD_GRACE_SECONDS, UNLOAD_POLL_SECONDS
+    global HTTP_TIMEOUT, POLITE_DELAY, EVERGREEN_MAX_DAYS, INCLUDE_UNDATED
+    global OUTPUT_MODE, CLASSIFY_BATCH_SIZE, CLASSIFY_DETAIL_LIMIT
+    global CALL_MAX_ATTEMPTS, CALL_BACKOFF_SECONDS, CLOUD_TIMEOUT, DEFAULT_MAX_TOKENS
     global GOBBLERCONNECT_PAGE_SIZE, GOBBLERCONNECT_MAX_EVENTS, EVENT_DETAIL_LIMIT
 
     MODEL_SPECS = models
@@ -123,10 +155,35 @@ def apply_config(cfg):
         JUDGE1_SPEC = models.get("judge1", WORKER_SPEC)
         JUDGE2_SPEC = models.get("judge2", WORKER_SPEC)
     NUM_JUDGES = max(0, min(int(stages.get("num_judges", 2)), 2))
-    JUDGE_THINKING = stages.get("judge_thinking", {}) or {}
+    # judge_thinking is the pre-rewrite name; both stages now read the same map,
+    # because the worker is no longer special.
+    MODEL_THINKING = dict(stages.get("judge_thinking") or {})
+    MODEL_THINKING.update(stages.get("model_thinking") or {})
+    # worker_max_attempts is the pre-rewrite name for the same thing.
+    CALL_MAX_ATTEMPTS = max(1, int(stages.get("call_max_attempts",
+                                              stages.get("worker_max_attempts", 3))))
+    CALL_BACKOFF_SECONDS = float(stages.get("call_backoff_seconds", 5))
+    CLASSIFY_BATCH_SIZE = max(1, int(stages.get("classify_batch_size", 25)))
+    CLASSIFY_DETAIL_LIMIT = max(0, int(stages.get("classify_detail_limit", 400)))
+    CLOUD_TIMEOUT = float(stages.get("cloud_timeout_seconds", 180))
+    DEFAULT_MAX_TOKENS = int(stages.get("max_tokens", 8192))
 
     SCRAPE_MODE = scrape.get("mode", "builtin")
+    if SCRAPE_MODE not in ("builtin",):
+        sys.exit(f'scraping.mode "{SCRAPE_MODE}" is no longer supported. '
+                 f'Extraction is deterministic now, so there is nothing for a '
+                 f'model to browse for -- set scraping.mode to "builtin".')
     SOURCES = cfg.get("_sources", [])
+    INCLUDE_UNDATED = bool(scrape.get("include_undated", True))
+
+    # Which outputs this run produces.
+    OUTPUT_MODE = str(cfg.get("output", {}).get("mode", "html+email")).lower().strip()
+    OUTPUT_MODE = {"both": "html+email", "email+html": "html+email",
+                   "html_only": "html", "email_only": "email"}.get(OUTPUT_MODE,
+                                                                   OUTPUT_MODE)
+    if OUTPUT_MODE not in ("html", "email", "html+email"):
+        sys.exit(f'output.mode must be "html", "email" or "html+email" '
+                 f'(got "{OUTPUT_MODE}").')
 
     NUM_CTX = ollama_cfg.get("num_ctx", 32768)
     NUM_GPU = ollama_cfg.get("num_gpu", 0)
@@ -134,12 +191,14 @@ def apply_config(cfg):
     # 0 is ideal for paid/proxied model providers (no local process to unload);
     # ~10 minutes is right for Ollama spinning large local models on/off disk.
     MODEL_UNLOAD_GRACE_SECONDS = ollama_cfg.get("model_unload_grace_seconds", 600)
+    UNLOAD_POLL_SECONDS = float(ollama_cfg.get("unload_poll_seconds", 10))
 
     SENDER_EMAIL = email["sender_email"]
+    # receiver_email accepts a single address or a list of them.
     RECEIVER_EMAIL = email["receiver_email"]
+    RECIPIENTS = ([RECEIVER_EMAIL] if isinstance(RECEIVER_EMAIL, str)
+                  else list(RECEIVER_EMAIL))
     PASSWORD = os.environ.get("PASSWORD")
-    if not PASSWORD:
-        print("WARNING: PASSWORD not set in .env -- email will fail.")
 
     HTML_FILE_PATH = report["html_file_path"]
     server_ip = report.get("server_ip", "")
@@ -170,10 +229,6 @@ apply_config(_CFG)
 CONTEXT = ssl.create_default_context()
 
 
-def _criteria_block(indent="   "):
-    return "\n".join(f"{indent}- {c}" for c in INTEREST_CRITERIA)
-
-
 def _spec_api_key(spec):
     """Secret key for a model spec, read from .env via its api_key_env name."""
     if not spec:
@@ -184,15 +239,10 @@ def _spec_api_key(spec):
     return os.environ.get(name)
 
 
-def _is_local(spec):
-    """True if a model spec is served locally (Ollama) vs. a cloud provider."""
-    return bool(spec) and spec.get("provider", "").lower() in ("ollama", "local")
-
-
 # Ollama model swap guard.
-# This machine only has enough RAM for the 70B worker model. Starting to load a
+# This machine cannot hold two ~19 GB models at once. Starting to load a
 # different model before the previous one has fully unloaded can crash the load,
-# so before any model switch we sleep to guarantee the old model is evicted.
+# so a switch waits for the old model to be evicted (see wait_for_model_unload).
 _last_ollama_model = None
 
 # Wall-clock origin for the elapsed column in every progress line. Set at import
@@ -215,17 +265,47 @@ def _stamp(message):
 
 
 def wait_for_model_unload(model_name):
-    """Sleep before loading `model_name` if a different Ollama model was the last
-    one used, guaranteeing the previous model has fully unloaded from RAM."""
+    """Wait for the previously used Ollama model to leave RAM.
+
+    This machine cannot hold two ~19 GB models at once, so a new load must not
+    begin until the old one is evicted. It used to sleep a flat
+    MODEL_UNLOAD_GRACE_SECONDS (10 min) on every switch -- 30 minutes a run,
+    paid whether or not the model had already gone. Since every call passes
+    keep_alive=0, the model is usually gone within seconds, so poll `ollama.ps`
+    instead and treat the grace as a ceiling rather than a cost.
+    """
     global _last_ollama_model
-    if _last_ollama_model and _last_ollama_model != model_name:
-        _stamp(f"UNLOAD  waiting {MODEL_UNLOAD_GRACE_SECONDS // 60} min for "
-               f"'{_last_ollama_model}' to leave RAM before loading '{model_name}'")
-        started = time.time()
-        time.sleep(MODEL_UNLOAD_GRACE_SECONDS)
-        _stamp(f"UNLOAD  done, '{_last_ollama_model}' unloaded "
-               f"({(time.time() - started) / 60:.1f} min)")
+    if not _last_ollama_model or _last_ollama_model == model_name:
+        _last_ollama_model = model_name
+        return
+
+    previous = _last_ollama_model
     _last_ollama_model = model_name
+    if MODEL_UNLOAD_GRACE_SECONDS <= 0:
+        return
+
+    _stamp(f"UNLOAD  waiting for '{previous}' to leave RAM before loading "
+           f"'{model_name}' (ceiling {MODEL_UNLOAD_GRACE_SECONDS // 60} min)")
+    started = time.time()
+    while time.time() - started < MODEL_UNLOAD_GRACE_SECONDS:
+        try:
+            loaded = ollama.ps()
+        except Exception as e:
+            # No way to ask -- fall back to the old unconditional sleep, which
+            # is the safe behavior.
+            print(f"  ollama.ps() unavailable ({e}); sleeping the full grace")
+            time.sleep(max(0.0, MODEL_UNLOAD_GRACE_SECONDS - (time.time() - started)))
+            break
+        models = getattr(loaded, "models", None)
+        if models is None and isinstance(loaded, dict):
+            models = loaded.get("models") or []
+        names = {getattr(m, "model", None) or (m.get("model") if isinstance(m, dict) else None)
+                 for m in (models or [])}
+        if previous not in names:
+            break
+        time.sleep(UNLOAD_POLL_SECONDS)
+    _stamp(f"UNLOAD  done, '{previous}' unloaded "
+           f"({(time.time() - started) / 60:.1f} min)")
 
 
 def wait_for_send_window():
@@ -260,9 +340,9 @@ def wait_for_send_window():
 # Selenium or a headless Chromium.
 # ---------------------------------------------------------------------------
 HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; vt-events-reminder/1.0)"}
-HTTP_TIMEOUT = 20
-POLITE_DELAY = 0.5          # seconds between event-detail page fetches
-EVERGREEN_MAX_DAYS = 60     # drop "events" that span longer than this (always-on listings)
+# HTTP_TIMEOUT / POLITE_DELAY / EVERGREEN_MAX_DAYS are NOT defined here -- they
+# come from config.json via apply_config(). They used to be re-declared at this
+# point, which silently overrode whatever config.json said.
 
 _MONTH_RE = (
     "January|February|March|April|May|June|July|August|September|October|"
@@ -364,13 +444,46 @@ def _facet_values(classes, prefix):
             for c in classes if c.startswith(prefix)]
 
 
-def _block(**fields):
-    """Render one event as a compact labelled block for the LLM prompt."""
-    lines = [f"{k}: {v}" for k, v in fields.items() if v]
-    return "\n".join(lines)
+@dataclass
+class Event:
+    """One scraped event.
+
+    This is the pipeline's only record type. Collectors build it, the report and
+    the email read it, and the model fills in `matches`/`reason` and nothing
+    else. Everything factual -- which events exist, when, where, whether the
+    source itself advertises free food -- is decided in code, because the
+    scraper already knows it. Asking a model to restate it was the single
+    largest cost in the old pipeline and the source of every dropped event.
+    """
+    title: str
+    when: str = ""
+    dates: list = field(default_factory=list)
+    location: str = ""
+    description: str = ""
+    category: str = ""
+    host: str = ""
+    link: str = ""
+    source_id: str = ""
+    source_url: str = ""
+    # Facets the source states outright (e.g. "FREE FOOD" from a listing CSS
+    # class). Authoritative -- never inferred.
+    flags: list = field(default_factory=list)
+    # Filled in by the classification phase: 1-based criterion numbers.
+    matches: list = field(default_factory=list)
+    reason: str = ""
+
+    @property
+    def key(self):
+        """Normalized title, used for de-duplication and lookups."""
+        return _normalize_text(self.title)
+
+    @property
+    def free_stuff(self):
+        """Human-readable free-food/giveaway summary, from the source's facets."""
+        return ", ".join(self.flags)
 
 
-def _event_detail_text(url, limit=EVENT_DETAIL_LIMIT):
+def _event_detail_text(url, limit=None):
     """Body text of an events.vt.edu detail page (description, time, location)."""
     try:
         soup = BeautifulSoup(_get(url), "html.parser")
@@ -381,12 +494,13 @@ def _event_detail_text(url, limit=EVENT_DETAIL_LIMIT):
     main = soup.select_one("main") or soup.select_one("[role=main]") or soup
     # Strip before truncating, so the character budget goes to description text
     # rather than to share widgets and the tag cloud.
+    limit = EVENT_DETAIL_LIMIT if limit is None else limit
     return _strip_boilerplate(_clean(main.get_text(" ", strip=True)))[:limit]
 
 
-def fetch_events_vt(week_start, week_end):
+def fetch_events_vt(source, week_start, week_end):
     """events.vt.edu -- month listing pages plus per-event detail pages."""
-    blocks, seen = [], set()
+    events, seen = [], set()
     months = []
     for d in (week_start, week_end):
         if (d.year, d.month) not in months:
@@ -397,12 +511,13 @@ def fetch_events_vt(week_start, week_end):
         try:
             soup = BeautifulSoup(_get(url), "html.parser")
         except Exception as e:
-            blocks.append(f"[Error fetching {url}: {e}]")
+            print(f"  [error] {url}: {e}")
             continue
 
         for li in soup.select("li.event-page"):
             text = _clean(li.get_text(" ", strip=True))
-            if not _in_week(_parse_dates(text, year), week_start, week_end):
+            dates = _parse_dates(text, year)
+            if not _in_week(dates, week_start, week_end):
                 continue
             anchor = li.select_one("a[href]")
             link = anchor["href"] if anchor else url
@@ -416,67 +531,100 @@ def fetch_events_vt(week_start, week_end):
             classes = li.get("class") or []
 
             time.sleep(POLITE_DELAY)
-            blocks.append(_block(
-                TITLE=title,
-                WHEN=when,
-                CATEGORY=", ".join(_facet_values(classes, "categories_-")),
-                LOCATION=", ".join(_facet_values(classes, "locations_-")),
-                DEPARTMENT=", ".join(_facet_values(classes, "departments_-")),
-                AUDIENCE=", ".join(_facet_values(classes, "audiences_-")),
-                FLAGS=", ".join(label for cls, label in EVENTS_VT_FLAGS.items()
-                                if cls in classes),
-                LINK=link,
-                DETAILS=_event_detail_text(link),
+            events.append(Event(
+                title=title,
+                when=when,
+                dates=dates,
+                location=", ".join(_facet_values(classes, "locations_-")),
+                description=_event_detail_text(link),
+                category=", ".join(_facet_values(classes, "categories_-")),
+                host=", ".join(_facet_values(classes, "departments_-")),
+                link=link,
+                source_id=source["id"],
+                source_url=source["url"],
+                # Read from the listing markup, not from the detail text: the
+                # site states these facets itself, so free-food detection never
+                # depends on a model reading a description.
+                flags=[label for cls, label in EVENTS_VT_FLAGS.items()
+                       if cls in classes],
             ))
-    return blocks
+    return events
 
 
-def fetch_career_vt(week_start, week_end):
+# career.vt.edu (uConnect) marks up each field inside the <li>; reading those
+# nodes gives a real title. The old fallback -- splitting on a literal "Event:"
+# that is not in the markup -- degraded to text[:160], producing titles like
+# "Career Outfitters Pop-Up Shop: August 28th | 12:00 - 4:00 Friday, August 28,
+# 2026 12pm - 4pm Fri, Aug 28 from 12pm..." for every entry.
+_CAREER_TITLE_SEL = ("h1, h2, h3, h4, .event_title, .event-title, "
+                     ".uc-event-title, a[href] .title")
+
+
+def fetch_career_vt(source, week_start, week_end):
     """career.vt.edu -- uConnect events archive (server-rendered)."""
-    url = "https://career.vt.edu/events/"
+    url = source["url"]
     try:
         soup = BeautifulSoup(_get(url), "html.parser")
     except Exception as e:
-        return [f"[Error fetching {url}: {e}]"]
+        print(f"  [error] {url}: {e}")
+        return []
 
-    blocks, seen = [], set()
+    events, seen = [], set()
     for li in soup.select("li.event_item"):
         text = _clean(li.get_text(" ", strip=True))
-        if not _in_week(_parse_dates(text, week_start.year), week_start, week_end):
+        dates = _parse_dates(text, week_start.year)
+        if not _in_week(dates, week_start, week_end):
             continue
         anchor = li.select_one("a[href]")
         link = anchor["href"] if anchor else url
         if link in seen:
             continue
         seen.add(link)
-        title = text.split("Event:", 1)[-1].strip() if "Event:" in text else text
-        blocks.append(_block(
-            TITLE=_clean(title)[:160],
-            CATEGORY="Career",
-            LINK=link,
-            DETAILS=text[:700],
+
+        node = li.select_one(_CAREER_TITLE_SEL)
+        title = _clean(node.get_text(" ", strip=True)) if node else ""
+        if not title and anchor:
+            # The anchor's own text is still far better than the whole <li>.
+            title = _clean(anchor.get_text(" ", strip=True))
+        if not title:
+            title = text[:160]
+        # uConnect prefixes the heading with a screen-reader label.
+        title = re.sub(r"^Event:\s*", "", title, flags=re.I)
+
+        when = ""
+        when_node = li.select_one("time, .event_date, .event-date, .uc-event-date")
+        if when_node:
+            when = _clean(when_node.get_text(" ", strip=True))
+
+        events.append(Event(
+            title=title[:200],
+            when=when,
+            dates=dates,
+            description=text[:700],
+            category="Career",
+            link=link,
+            source_id=source["id"],
+            source_url=source["url"],
         ))
-    return blocks
+    return events
 
 
-def fetch_gobblerconnect(week_start, week_end,
-                         page_size=GOBBLERCONNECT_PAGE_SIZE,
-                         max_events=GOBBLERCONNECT_MAX_EVENTS):
+def fetch_gobblerconnect(source, week_start, week_end):
     """GobblerConnect -- CampusGroups JSON web service (no browser needed).
 
     The /events page renders client-side from this same endpoint, so we read the
     structured records directly instead of driving a headless browser.
     """
     base = "https://gobblerconnect.vt.edu/mobile_ws/v17/mobile_events_list"
-    blocks, seen = [], set()
+    events, seen = [], set()
 
-    for offset in range(0, max_events, page_size):
-        url = (f"{base}?range={offset}&limit={page_size}"
+    for offset in range(0, GOBBLERCONNECT_MAX_EVENTS, GOBBLERCONNECT_PAGE_SIZE):
+        url = (f"{base}?range={offset}&limit={GOBBLERCONNECT_PAGE_SIZE}"
                f"&filter4_contains=OR&order=undefined")
         try:
             rows = _get(url, as_json=True)
         except Exception as e:
-            blocks.append(f"[Error fetching GobblerConnect: {e}]")
+            print(f"  [error] GobblerConnect: {e}")
             break
         if not rows:
             break
@@ -491,33 +639,44 @@ def fetch_gobblerconnect(week_start, week_end,
                 continue
 
             when = _clean(BeautifulSoup(rec.get("eventDates") or "", "html.parser")
-                          .get_text(" ").replace("–", "-"))
-            if not _in_week(_parse_dates(when, week_start.year), week_start, week_end):
+                          .get_text(" ").replace("\u2013", "-"))
+            dates = _parse_dates(when, week_start.year)
+            if not _in_week(dates, week_start, week_end):
                 continue
             seen.add(event_id)
 
             event_url = rec.get("eventUrl") or ""
             if event_url.startswith("/"):
                 event_url = "https://gobblerconnect.vt.edu" + event_url
-            blocks.append(_block(
-                TITLE=_clean(rec.get("eventName")),
-                WHEN=when,
-                LOCATION=_clean(rec.get("eventLocation")),
-                CATEGORY=_clean(rec.get("eventCategory")),
-                HOST=_clean(rec.get("clubName")),
-                LINK=event_url,
+            events.append(Event(
+                title=_clean(rec.get("eventName")),
+                when=when,
+                dates=dates,
+                location=_clean(rec.get("eventLocation")),
+                category=_clean(rec.get("eventCategory")),
+                host=_clean(rec.get("clubName")),
+                link=event_url or source["url"],
+                source_id=source["id"],
+                source_url=source["url"],
             ))
-    return blocks
+    return events
 
 
-def fetch_news_vt(url):
-    """news.vt.edu notices / stories -- link text is the headline."""
+def fetch_news_vt(source, week_start, week_end):
+    """news.vt.edu notices / stories -- link text is the headline.
+
+    Notices carry no date in the listing markup, so unlike every other collector
+    this one cannot week-filter. `scraping.include_undated` decides whether they
+    are collected at all; they are marked `undated` so the report can say so.
+    """
+    url = source["url"]
     try:
         soup = BeautifulSoup(_get(url), "html.parser")
     except Exception as e:
-        return [f"[Error fetching {url}: {e}]"]
+        print(f"  [error] {url}: {e}")
+        return []
 
-    blocks, seen = [], set()
+    events, seen = [], set()
     for anchor in soup.select("a[href]"):
         href = anchor.get("href", "")
         if not re.search(r"/notices/|/articles/20", href):
@@ -528,101 +687,256 @@ def fetch_news_vt(url):
         seen.add(title)
         if href.startswith("/"):
             href = "https://news.vt.edu" + href
-        blocks.append(_block(TITLE=title, LINK=href))
-    return blocks
+        dates = _parse_dates(title, week_start.year)
+        if dates and not _in_week(dates, week_start, week_end):
+            continue
+        if not dates and not INCLUDE_UNDATED:
+            continue
+        events.append(Event(
+            title=title,
+            dates=dates,
+            category="Notice",
+            link=href,
+            source_id=source["id"],
+            source_url=source["url"],
+            flags=[] if dates else ["undated"],
+        ))
+    return events
 
 
-def _builtin_collector(source, week_start, week_end):
-    """Return the right fetch callable for one sources.json entry."""
-    url = source["url"]
-    stype = source.get("type")
-    if stype == "events_vt":
-        return lambda: fetch_events_vt(week_start, week_end)
-    if stype == "career_vt":
-        return lambda: fetch_career_vt(week_start, week_end)
-    if stype == "gobblerconnect":
-        return lambda: fetch_gobblerconnect(week_start, week_end)
-    if stype == "news":
-        return lambda: fetch_news_vt(url)
-    return None
+_COLLECTORS = {
+    "events_vt": fetch_events_vt,
+    "career_vt": fetch_career_vt,
+    "gobblerconnect": fetch_gobblerconnect,
+    "news": fetch_news_vt,
+}
+
+
+def render_event(event, index=None):
+    """One event as a compact labelled block.
+
+    Used for the classification prompt and for --save-scrape debugging. Only the
+    fields that help a "does this match an interest" decision are included --
+    the full DETAILS text is truncated hard, because the old prompts spent most
+    of their ~19k tokens on description blobs the decision never needed.
+    """
+    head = f"[{index}] " if index is not None else ""
+    lines = [f"{head}TITLE: {event.title}"]
+    for label, value in (("WHEN", event.when),
+                         ("LOCATION", event.location),
+                         ("CATEGORY", event.category),
+                         ("HOST", event.host),
+                         ("FLAGS", ", ".join(event.flags))):
+        if value:
+            lines.append(f"    {label}: {value}")
+    if event.description:
+        lines.append(f"    DETAILS: {event.description[:CLASSIFY_DETAIL_LIMIT]}")
+    return "\n".join(lines)
 
 
 def get_vt_data():
-    """Collect this week's VT events.
+    """Collect this week's VT events from every source in sources.json.
 
-    Two scrape modes are supported, set via `scraping.mode` in config.json:
-
-    builtin        Fetch each source in sources.json with our requests +
-                   BeautifulSoup parsers, producing TITLE:/WHEN:/... blocks.
-                   This is the path for local (Ollama) workers, which have no
-                   built-in web search.
-
-    web_search     Hand the list of source URLs to the worker model, which uses
-                   its own web-search / browsing tools to look them up itself.
-                   Meant for cloud providers (Gemini, OpenAI, Claude, ...) that
-                   expose a model-side search tool.
-
-    Returns (combined_content, sources) where `sources` maps each URL to the
-    text collected from it, used later to attribute events back to a link.
+    Returns a flat list[Event]. Extraction is entirely deterministic: each
+    source has a dedicated parser, and what those parsers produce IS the event
+    list. There is no model in this path, so events cannot be dropped,
+    duplicated or invented, and the completeness checking, judging and revision
+    machinery that used to police a model's transcription is gone with it.
     """
     week_start, week_end = week_bounds()
-
-    if SCRAPE_MODE == "web_search":
-        # No local fetch -- let the (paid) worker model browse the sources.
-        _stamp(f"SCRAPE  web_search mode -- worker will look up {len(SOURCES)} sources itself")
-        urls = "\n".join(f"- {s.get('name','')} ({s['url']})" for s in SOURCES)
-        directive = (f"You must use your web search and browsing tools to look up "
-                     f"these Virginia Tech event/notice sources yourself:\n{urls}\n"
-                     f"Return every event you find for the current week.")
-        return directive, {}
-
     scrape_started = time.time()
     _stamp(f"SCRAPE  start -- collecting events for {week_start} .. {week_end}")
 
-    collectors = []
+    events = []
     for source in SOURCES:
-        collect = _builtin_collector(source, week_start, week_end)
-        if collect:
-            collectors.append((source["url"], collect))
-        else:
+        collect = _COLLECTORS.get(source.get("type"))
+        if not collect:
             print(f"Skipping source with unknown type: {source!r}")
-
-    combined_content = ""
-    sources = {}
-    for url, collect in collectors:
-        print(f"Fetching {url}...")
+            continue
+        print(f"Fetching {source['url']}...")
         try:
-            blocks = collect()
+            found = collect(source, week_start, week_end)
         except Exception as e:
-            blocks = [f"[Error fetching {url}: {e}]"]
-        # An empty source says so explicitly; it never falls back to dumping
-        # navigation boilerplate, which used to flood the prompt with menu text.
-        section = "\n\n".join(blocks) if blocks else "(no entries found for this week)"
-        combined_content += f"\n\n=== SOURCE: {url} ===\n{section}"
-        sources[url] = section
-        print(f"  collected {len(blocks)} entries ({len(section)} chars)")
+            print(f"  [error] {source['url']}: {e}")
+            found = []
+        print(f"  collected {len(found)} events")
+        if not found:
+            # A source that used to return events and now returns none is the
+            # silent failure mode a VT redesign causes, so say so loudly rather
+            # than letting an empty digest look like a quiet week.
+            print(f"  WARNING: {source['id']} returned no events this week")
+        events.extend(found)
 
+    events = dedupe_events(events)
     _stamp(f"SCRAPE  done in {(time.time() - scrape_started) / 60:.1f} min "
-           f"({len(combined_content)} chars, {count_source_events(combined_content)} event blocks)")
-    return combined_content, sources
+           f"({len(events)} events after de-duplication)")
+    return events
 
-def _call_ollama(spec, prompt, thinking=None):
-    if not ollama:
-        raise ImportError("Ollama library not found. Run 'pip install ollama'")
-    model = spec["model"]
-    wait_for_model_unload(model)
-    options = {'num_ctx': NUM_CTX, 'num_gpu': NUM_GPU, 'num_thread': NUM_THREAD}
-    _stamp(f"LOAD    '{model}' (num_ctx={NUM_CTX}, num_gpu={NUM_GPU}, "
-           f"num_thread={NUM_THREAD}, think={thinking}, prompt={len(prompt)} chars)")
-    started = time.time()
-    kwargs = dict(model=model, prompt=prompt, options=options, keep_alive=0)
-    if thinking is not None:
-        kwargs['think'] = thinking
-    response = ollama.generate(**kwargs)
-    _stamp(f"DONE    '{model}' returned after {(time.time() - started) / 60:.1f} min; "
-           f"model unloading (keep_alive=0)")
-    _log_ollama_cost(model, response)
-    return response['response']
+
+def dedupe_events(events):
+    """Drop repeats of the same title, keeping the richest record.
+
+    The same event is often listed on both events.vt.edu and GobblerConnect.
+    Preferring the entry with the most filled-in fields keeps whichever source
+    carried the description and the facets.
+    """
+    best = {}
+    order = []
+    for event in events:
+        k = event.key
+        if not k:
+            continue
+        if k not in best:
+            best[k] = event
+            order.append(k)
+            continue
+        incumbent = best[k]
+        if _richness(event) > _richness(incumbent):
+            # Keep any flags the loser had -- facets are additive evidence.
+            for flag in incumbent.flags:
+                if flag not in event.flags:
+                    event.flags.append(flag)
+            best[k] = event
+        else:
+            for flag in event.flags:
+                if flag not in incumbent.flags:
+                    incumbent.flags.append(flag)
+    return [best[k] for k in order]
+
+
+def _richness(event):
+    return sum(bool(v) for v in (event.when, event.location, event.description,
+                                 event.category, event.host, event.link,
+                                 event.flags))
+
+
+# ---------------------------------------------------------------------------
+# Providers
+#
+# One interface, one implementation per backend. Local and cloud are both first
+# class and optimized for opposite things: Ollama for an overnight box where one
+# ~19 GB model must leave RAM before the next loads, cloud for someone who wants
+# the digest in five minutes and can run every batch at once.
+# ---------------------------------------------------------------------------
+
+
+class Provider:
+    """Base interface. `generate` returns raw text; JSON handling is per-backend."""
+
+    #: Cloud backends can run batches in parallel; a single local llama.cpp
+    #: process cannot, and trying would just thrash the same memory bandwidth.
+    supports_concurrency = False
+    #: Only Ollama has a model to evict before the next one loads.
+    needs_unload_guard = False
+
+    def __init__(self, spec):
+        self.spec = spec
+        self.model = spec.get("model", "")
+        self.url = spec.get("url") or None
+        self.max_tokens = int(spec.get("max_tokens") or DEFAULT_MAX_TOKENS)
+
+    def generate(self, prompt, want_json=False, thinking=None):
+        raise NotImplementedError
+
+    def __str__(self):
+        return f"{self.spec.get('provider', '?')}:{self.model}"
+
+
+class OllamaProvider(Provider):
+    needs_unload_guard = True
+
+    def generate(self, prompt, want_json=False, thinking=None):
+        if not ollama:
+            raise ImportError("Ollama library not found. Run 'pip install ollama'")
+        wait_for_model_unload(self.model)
+        options = {"num_ctx": NUM_CTX, "num_gpu": NUM_GPU, "num_thread": NUM_THREAD}
+        if want_json:
+            # Ollama constrains sampling to valid JSON, which removes most of
+            # what extract_json() used to have to repair.
+            options["format"] = "json"
+        _stamp(f"LOAD    '{self.model}' (num_ctx={NUM_CTX}, num_gpu={NUM_GPU}, "
+               f"num_thread={NUM_THREAD}, think={thinking}, "
+               f"prompt={len(prompt)} chars)")
+        started = time.time()
+        kwargs = dict(model=self.model, prompt=prompt, options=options, keep_alive=0)
+        if want_json:
+            kwargs["format"] = "json"
+        if thinking is not None:
+            kwargs["think"] = thinking
+        response = ollama.generate(**kwargs)
+        _stamp(f"DONE    '{self.model}' returned after "
+               f"{(time.time() - started) / 60:.1f} min")
+        _log_ollama_cost(self.model, response)
+        return response["response"]
+
+
+class OpenAIProvider(Provider):
+    supports_concurrency = True
+
+    def generate(self, prompt, want_json=False, thinking=None):
+        from openai import OpenAI
+        client = OpenAI(base_url=self.url, api_key=_spec_api_key(self.spec),
+                        timeout=CLOUD_TIMEOUT)
+        kwargs = dict(model=self.model, max_tokens=self.max_tokens,
+                      messages=[{"role": "user", "content": prompt}])
+        if want_json:
+            kwargs["response_format"] = {"type": "json_object"}
+        response = client.chat.completions.create(**kwargs)
+        return response.choices[0].message.content or ""
+
+
+class AnthropicProvider(Provider):
+    supports_concurrency = True
+
+    def generate(self, prompt, want_json=False, thinking=None):
+        import anthropic
+        client = anthropic.Anthropic(api_key=_spec_api_key(self.spec),
+                                     base_url=self.url, timeout=CLOUD_TIMEOUT)
+        messages = [{"role": "user", "content": prompt}]
+        if want_json:
+            # Prefilling the assistant turn with "{" is Anthropic's JSON mode:
+            # the reply continues from there, so it cannot open with prose.
+            messages.append({"role": "assistant", "content": "{"})
+        message = client.messages.create(model=self.model,
+                                         max_tokens=self.max_tokens,
+                                         messages=messages)
+        text = "".join(b.text for b in message.content if b.type == "text")
+        return ("{" + text) if want_json else text
+
+
+class GeminiProvider(Provider):
+    supports_concurrency = True
+
+    def generate(self, prompt, want_json=False, thinking=None):
+        from google import genai
+        from google.genai import types
+        client = genai.Client(api_key=_spec_api_key(self.spec))
+        config = types.GenerateContentConfig(max_output_tokens=self.max_tokens)
+        if want_json:
+            config.response_mime_type = "application/json"
+        response = client.models.generate_content(model=self.model,
+                                                  contents=prompt,
+                                                  config=config)
+        return response.text or ""
+
+
+_PROVIDERS = {
+    "ollama": OllamaProvider,
+    "local": OllamaProvider,
+    "openai": OpenAIProvider,
+    "anthropic": AnthropicProvider,
+    "claude": AnthropicProvider,
+    "gemini": GeminiProvider,
+}
+
+
+def make_provider(spec):
+    name = (spec.get("provider") or "").lower()
+    try:
+        return _PROVIDERS[name](spec)
+    except KeyError:
+        raise ValueError(f"Unknown model provider: {spec.get('provider')!r}. "
+                         f"Known: {', '.join(sorted(set(_PROVIDERS)))}")
 
 
 def _log_ollama_cost(model, response):
@@ -635,316 +949,227 @@ def _log_ollama_cost(model, response):
           f"{note} in {minutes:.1f} min")
 
 
-def _call_openai(spec, prompt):
-    from openai import OpenAI
-    client = OpenAI(base_url=spec["url"], api_key=_spec_api_key(spec))
-    response = client.chat.completions.create(
-        model=spec["model"],
-        messages=[{"role": "user", "content": prompt}],
-    )
-    msg = response.choices[0].message
-    return msg.content or ""
+# Errors that a retry cannot fix: a rejected request shape, a missing model, a
+# bad key. Retrying these only delays the run and muddies the log.
+_PERMANENT_ERROR_RE = re.compile(
+    r"does not support|not found|invalid[_ ]api[_ ]key|authentication|"
+    r"unauthorized|permission denied|model .* does not exist", re.I)
 
 
-def _call_anthropic(spec, prompt):
-    import anthropic
-    client = anthropic.Anthropic(api_key=_spec_api_key(spec), base_url=spec["url"])
-    message = client.messages.create(
-        model=spec["model"],
-        max_tokens=8192,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return "".join(block.text for block in message.content if block.type == "text")
+def _is_permanent(error):
+    return bool(_PERMANENT_ERROR_RE.search(str(error)))
 
 
-def _call_gemini(spec, prompt):
-    import google.generativeai as genai
-    genai.configure(api_key=_spec_api_key(spec))
-    try:
-        model = genai.GenerativeModel(model_name=spec["model"],
-                                      tools=[{'google_search': {}}])
-    except Exception:
-        model = genai.GenerativeModel(model_name=spec["model"])
-    return model.generate_content(prompt).text
+def call_model(provider, prompt, want_json=True, thinking=None, label=""):
+    """One model call with retry/backoff, returning raw text.
 
-
-def call_model(spec, prompt, thinking=None, label=""):
-    """Send `prompt` to `spec`'s provider, returning the raw text reply."""
-    provider = spec.get("provider", "").lower()
-    tag = label or spec.get("model", provider)
-    _stamp(f"CALL    provider='{provider}' model='{spec.get('model')}' "
-           f"url='{spec.get('url')}' ({tag}) prompt={len(prompt)} chars")
-    if provider in ("ollama", "local"):
-        return _call_ollama(spec, prompt, thinking)
-    if provider == "openai":
-        return _call_openai(spec, prompt)
-    if provider == "anthropic" or provider == "claude":
-        return _call_anthropic(spec, prompt)
-    if provider == "gemini":
-        return _call_gemini(spec, prompt)
-    raise ValueError(f"Unknown model provider: {provider!r}")
-
-
-def worker_call(prompt):
-    """Run the worker model on `prompt` (a get_prompt or revision prompt)."""
-    return call_model(WORKER_SPEC, prompt)
-
-
-def count_source_events(vt_content):
-    """Exact number of event blocks in the scraped content.
-
-    Counting is something code does perfectly and LLMs do badly, so the
-    extraction-completeness check never goes to a model.
+    Retries cover the transient cloud failures (429s, 5xx, dropped
+    connections) that used to kill a whole stage, and the occasional local
+    hiccup. The caller decides what to do when every attempt fails.
     """
-    return len(re.findall(r"^TITLE: ", vt_content, re.M))
+    tag = label or str(provider)
+    last_error = None
+    for attempt in range(1, CALL_MAX_ATTEMPTS + 1):
+        try:
+            _stamp(f"CALL    {provider} ({tag}) attempt {attempt}/"
+                   f"{CALL_MAX_ATTEMPTS}, prompt={len(prompt)} chars")
+            return provider.generate(prompt, want_json=want_json, thinking=thinking)
+        except Exception as e:
+            last_error = e
+            print(f"  call failed ({type(e).__name__}: {e})")
+            if _is_permanent(e):
+                print("  not retrying -- this error will not resolve on a retry")
+                break
+            if attempt < CALL_MAX_ATTEMPTS:
+                backoff = CALL_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                print(f"  retrying in {backoff}s")
+                time.sleep(backoff)
+    raise RuntimeError(f"{tag}: all {CALL_MAX_ATTEMPTS} attempts failed: {last_error}")
 
 
-def run_judge(spec, vt_content, worker_events, today, week_end):
-    """Ask one judge to REPORT issues. Judges never rewrite the event list.
+# ---------------------------------------------------------------------------
+# Classification
+#
+# The only thing a model is actually needed for. Extraction is deterministic, so
+# what remains is one genuinely fuzzy question per event -- "does this match an
+# interest criterion?" -- answered a batch at a time, returning an index and a
+# short list of criterion numbers rather than a restatement of the event.
+# ---------------------------------------------------------------------------
 
-    With two independent reviewers a wholesale `corrected_output` from each is
-    incoherent -- whose rewrite wins? So judges only report, and the worker
-    stays the single writer, re-queried once with the merged critique.
 
-    The judge model can be any configured provider -- same or different from
-    the worker.
+def _criteria_block(indent="   "):
+    return "\n".join(f"{indent}{c['n']}. {c['text']}" for c in INTEREST_CRITERIA)
+
+
+def auto_matches(event):
+    """Criteria the source itself already settles, with no model call.
+
+    events.vt.edu states free food and giveaways as listing CSS classes. A
+    criterion can claim those facets via `auto_match_flags` in interests.json,
+    and then an event carrying the facet matches outright -- the fact is
+    published by the source, so inferring it would only add a way to be wrong.
     """
-    prompt = f"""
-This week runs from {today} through {week_end}.
+    matched = []
+    flags = {f.upper() for f in event.flags}
+    for criterion in INTEREST_CRITERIA:
+        wanted = {f.upper() for f in criterion.get("auto_match_flags") or []}
+        if wanted & flags:
+            matched.append(criterion["n"])
+    return matched
 
-You are a quality-control reviewer. Below is the text scraped from Virginia Tech pages, followed by a
-worker AI's extracted event list. Assess BOTH completeness of extraction AND correctness of filtering.
 
-WORKER OUTPUT:
-{json.dumps(worker_events, indent=2)}
+def get_classify_prompt(batch, start_index, today, week_end):
+    """Prompt for one batch. Output is a few tokens per event."""
+    listing = "\n".join(render_event(e, start_index + i)
+                         for i, e in enumerate(batch))
+    return f"""This week runs from {today} through {week_end}.
 
-SCRAPED CONTENT:
-{vt_content}
+You are filtering Virginia Tech campus events for one person. For each numbered
+event below, decide which of their interest criteria it matches.
 
-The high-interest criteria are:
+INTEREST CRITERIA:
 {_criteria_block()}
 
-INSTRUCTIONS:
-1. Every event block in the scraped content begins with "TITLE:". Find blocks missing from "all_events".
-2. Find events in "filtered_events" that match NONE of the criteria (false inclusions).
-3. Find events in "all_events" that DO match a criterion but are absent from "filtered_events".
-Quote titles EXACTLY as they appear. Do not rewrite the event list -- only report.
+EVENTS:
+{listing}
 
-Return valid JSON only (no markdown fences, no conversational text):
-{{
-  "missing_events": ["exact title of an event in the scraped content but not in all_events"],
-  "wrongly_included": ["exact title of an event in filtered_events matching no criterion"],
-  "should_be_filtered": ["exact title of an event in all_events that matches a criterion"],
-  "notes": ["any other correctness problem worth flagging"]
-}}
-Use empty lists when you find nothing. Do not invent events that are not in the scraped content.
+Return valid JSON only -- no markdown fences, no conversational text:
+{{"results": [{{"i": <the number in brackets>, "matches": [<criterion numbers>], "reason": "<short phrase>"}}]}}
+
+Rules:
+- Include exactly one entry for EVERY event shown, in order.
+- "matches" is a list of criterion numbers from the list above. Use [] when the
+  event matches none of them.
+- "reason" is one short phrase naming what matched; use "" when "matches" is [].
+- A FLAGS line comes from the event listing itself and is reliable evidence.
+- Judge only the event shown. Do not invent events.
 """
 
-    model_name = spec.get("model")
-    think = JUDGE_THINKING.get(model_name, True) if _is_local(spec) else None
-    raw = call_model(spec, prompt, thinking=think, label=f"judge {model_name}")
-    return json.loads(extract_json(raw))
+
+def _parse_classification(raw, batch_size, start_index):
+    """Turn one batch reply into {index: (matches, reason)}."""
+    payload = json.loads(extract_json(raw))
+    results = payload.get("results")
+    if results is None and isinstance(payload, dict):
+        # Some models return a bare list under another key, or the list itself.
+        for value in payload.values():
+            if isinstance(value, list):
+                results = value
+                break
+    parsed = {}
+    valid = {c["n"] for c in INTEREST_CRITERIA}
+    for entry in results or []:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            index = int(entry.get("i"))
+        except (TypeError, ValueError):
+            continue
+        if not (start_index <= index < start_index + batch_size):
+            continue
+        matches = [int(m) for m in (entry.get("matches") or [])
+                   if str(m).strip().lstrip("-").isdigit() and int(m) in valid]
+        parsed[index] = (matches, str(entry.get("reason") or "").strip())
+    return parsed
 
 
-def merge_judgements(reports):
-    """Combine independent judge reports, weighting the two error types differently.
+def classify(events, provider, today, week_end, label):
+    """Classify every event with one model, a batch at a time.
 
-    The costs are asymmetric: missing a free-food event is the failure that
-    actually matters, while an extra event in the email is nearly free. So
-    additions (missed events, events that should have been filtered in) take the
-    UNION -- one judge spotting it is enough -- while removals require UNANIMOUS
-    agreement, so a single overzealous reviewer cannot prune a real hit.
+    Returns {index: (matches, reason)}. A batch whose reply never parses is
+    skipped rather than aborting the run -- the cost of a bad batch is 25
+    events falling back to whatever the other reviewers said, not the loss of
+    the whole night's work.
     """
-    def collect(key):
-        merged, seen = [], set()
-        for report in reports:
-            for item in report.get(key) or []:
-                k = _normalize_text(item).strip()
-                if k and k not in seen:
-                    seen.add(k)
-                    merged.append(item)
-        return merged
-
-    remove_sets, labels = [], {}
-    for report in reports:
-        votes = set()
-        for item in report.get("wrongly_included") or []:
-            k = _normalize_text(item).strip()
-            if k:
-                votes.add(k)
-                labels.setdefault(k, item)
-        remove_sets.append(votes)
-
-    agreed = set.intersection(*remove_sets) if remove_sets else set()
-    flagged = set().union(*remove_sets) if remove_sets else set()
-
-    return {
-        "missing_events": collect("missing_events"),
-        "should_be_filtered": collect("should_be_filtered"),
-        "wrongly_included": [labels[k] for k in agreed],
-        "contested_removals": [labels[k] for k in flagged - agreed],
-        "notes": collect("notes"),
-    }
+    results = {}
+    total = (len(events) + CLASSIFY_BATCH_SIZE - 1) // CLASSIFY_BATCH_SIZE
+    for batch_no, start in enumerate(range(0, len(events), CLASSIFY_BATCH_SIZE), 1):
+        batch = events[start:start + CLASSIFY_BATCH_SIZE]
+        prompt = get_classify_prompt(batch, start, today, week_end)
+        tag = f"{label} batch {batch_no}/{total}"
+        try:
+            raw = call_model(provider, prompt, want_json=True,
+                             thinking=_thinking_for(provider), label=tag)
+            parsed = _parse_classification(raw, len(batch), start)
+        except Exception as e:
+            print(f"[{tag}] failed ({e}). Skipping this batch.")
+            continue
+        missing = len(batch) - len(parsed)
+        if missing:
+            print(f"[{tag}] returned {len(parsed)}/{len(batch)} verdicts "
+                  f"({missing} event(s) left unjudged by this reviewer)")
+        results.update(parsed)
+    return results
 
 
-def build_critique(verdict, expected_count, actual_count):
-    """Render the merged verdict as feedback for the worker's second attempt."""
-    lines = []
-    if expected_count is not None and expected_count > actual_count:
-        lines.append(
-            f"- The scraped content contains {expected_count} event blocks but you returned "
-            f"{actual_count}. Extract EVERY block that begins with 'TITLE:'."
-        )
-    for title in verdict["missing_events"]:
-        lines.append(f"- Missing from all_events: {title}")
-    for title in verdict["should_be_filtered"]:
-        lines.append(f"- Matches an interest criterion, add to filtered_events: {title}")
-    for title in verdict["wrongly_included"]:
-        lines.append(f"- Both reviewers agree this matches no criterion, remove from "
-                     f"filtered_events: {title}")
-    for note in verdict["notes"]:
-        lines.append(f"- {note}")
-    return "\n".join(lines)
+def _thinking_for(provider):
+    """Ollama reasoning on/off for this model, or None to leave it to Ollama.
 
-
-def get_revision_prompt(vt_content, today, critique, existing_titles):
-    """Ask the worker only for what is MISSING -- never for a rewrite.
-
-    The first pass already produced a usable list, and re-emitting it is pure
-    cost: generation runs at ~0.8 tok/s here, and a measured 63-event rewrite
-    was 12,629 tokens and 4h17m -- over half the entire run. So the revision is
-    handed the titles it already has (cheap to send, a few tokens each) and
-    returns only new entries, which `apply_revision()` folds in.
-
-    Removals are not asked for at all. A unanimous "wrongly_included" verdict is
-    a title match, which code does exactly and a model does approximately.
+    Returning None matters: it means `think` is never sent, which is the only
+    thing that works for a model with no reasoning mode -- Ollama rejects the
+    request outright with "does not support thinking". So a model absent from
+    the map keeps Ollama's own default rather than being forced either way.
     """
-    week_end = (datetime.now() + timedelta(days=6 - datetime.now().weekday())).strftime("%A, %B %d, %Y")
-    already = "\n".join(f"- {t}" for t in existing_titles) or "(none)"
-    return f"""
-    This week runs from {today} through {week_end}.
+    if not isinstance(provider, OllamaProvider):
+        return None
+    return MODEL_THINKING.get(provider.model)
 
-    You previously extracted events from the Virginia Tech content below, but the list is
-    INCOMPLETE. Reviewers and an exact block count found the problems listed under FEEDBACK.
 
-    EVENTS YOU ALREADY HAVE — do NOT repeat any of these in your answer:
-{already}
+def run_classification(events, today, week_end):
+    """Fill in `matches`/`reason` on every event.
 
-    FEEDBACK:
-{critique}
-
-    Content scraped from VT:
-    {vt_content}
-
-    The high-interest criteria are:
-{_criteria_block("    ")}
-
-    YOUR TASK: return ONLY the events that are missing from the list above. Every block in the
-    scraped content begins with "TITLE:" — find the ones absent from "EVENTS YOU ALREADY HAVE"
-    and return them. Do not restate events you already have. Do not remove anything.
-
-    OUTPUT FORMAT — valid JSON only, no markdown fences, no conversational text:
-    {{
-      "new_events": [
-        {{"title": "...", "time": "...", "location": "...", "description": "...", "free_stuff": "...", "category": "..."}}
-      ],
-      "new_filtered": [
-        {{"title": "...", "time": "...", "location": "...", "description": "...", "free_stuff": "...", "category": "...", "reason": "why it matched interest"}}
-      ]
-    }}
-    "new_filtered" holds only those events — whether newly found or already in the list above —
-    that match a criterion and are not yet marked high-interest. Use empty lists if there is
-    nothing to add. Do not invent events that are not in the scraped content.
+    Reviewers vote by union: an event is high-interest if the worker OR any
+    judge says it matches. That keeps the asymmetry the old merge rules were
+    built for -- a missed free-food event is the failure that matters, an extra
+    line in the email costs nothing -- without any of the merge machinery,
+    because there is no longer a list for reviewers to disagree about.
     """
+    for event in events:
+        event.matches = auto_matches(event)
+        if event.matches:
+            event.reason = "flagged by the source: " + event.free_stuff
+
+    specs = [("worker", WORKER_SPEC)]
+    if NUM_JUDGES >= 1:
+        specs.append(("judge1", JUDGE1_SPEC))
+    if NUM_JUDGES >= 2:
+        specs.append(("judge2", JUDGE2_SPEC))
+
+    reviewed = 0
+    for label, spec in specs:
+        try:
+            provider = make_provider(spec)
+        except Exception as e:
+            print(f"[{label}] unusable ({e}). Skipping this reviewer.")
+            continue
+        try:
+            verdicts = classify(events, provider, today, week_end, label)
+        except Exception as e:
+            print(f"[{label}] failed ({e}). Continuing without it.")
+            continue
+        reviewed += 1
+        added = 0
+        for index, (matches, reason) in verdicts.items():
+            event = events[index]
+            new = [m for m in matches if m not in event.matches]
+            if new:
+                event.matches.extend(new)
+                added += 1
+                if not event.reason and reason:
+                    event.reason = reason
+            elif matches and not event.reason and reason:
+                event.reason = reason
+        print(f"[{label}] added {added} new high-interest match(es)")
+
+    if not reviewed:
+        print("WARNING: no reviewer succeeded. High-interest events are those "
+              "the sources flagged themselves.")
+    return reviewed
 
 
-def apply_revision(events, revision, verdict):
-    """Fold the revision's additions into the existing list, in code.
+def high_interest(events):
+    return [e for e in events if e.matches]
 
-    The worker only ever adds; merging, de-duplicating and removing all happen
-    here, where they are exact. Returns (merged_events, summary string).
-    """
-    all_events = list(events.get("all_events") or [])
-    filtered = list(events.get("filtered_events") or [])
-
-    def key(item):
-        return _normalize_text(item.get("title") if isinstance(item, dict) else item).strip()
-
-    seen_all = {key(e) for e in all_events}
-    seen_filtered = {key(e) for e in filtered}
-
-    added_all = 0
-    for event in revision.get("new_events") or []:
-        k = key(event)
-        if k and k not in seen_all:
-            seen_all.add(k)
-            all_events.append(event)
-            added_all += 1
-
-    added_filtered = 0
-    for event in revision.get("new_filtered") or []:
-        k = key(event)
-        if k and k not in seen_filtered:
-            seen_filtered.add(k)
-            filtered.append(event)
-            added_filtered += 1
-            # A high-interest event the first pass missed entirely still belongs
-            # in the full list, or the HTML report would omit what the email
-            # advertises.
-            if k not in seen_all:
-                seen_all.add(k)
-                all_events.append(event)
-                added_all += 1
-
-    # Unanimous removals, applied by exact title match rather than by asking a
-    # model to reproduce the list without them.
-    drop = {_normalize_text(t).strip() for t in verdict.get("wrongly_included") or []}
-    drop.discard("")
-    removed = 0
-    if drop:
-        kept = [e for e in filtered if key(e) not in drop]
-        removed = len(filtered) - len(kept)
-        filtered = kept
-
-    events["all_events"] = all_events
-    events["filtered_events"] = filtered
-    summary = (f"+{added_all} events, +{added_filtered} high-interest, "
-               f"-{removed} removed from high-interest")
-    return events, summary
-
-
-def get_prompt(vt_content, today):
-    week_end = (datetime.now() + timedelta(days=6 - datetime.now().weekday())).strftime("%A, %B %d, %Y")
-    return f"""
-    This week runs from {today} through {week_end}.
-    I need a comprehensive list of EVERY event, presentation, job fair, or notice happening on the Virginia Tech Blacksburg campus this week.
-    
-    For each event, I need:
-    - Title
-    - Time
-    - Location
-    - Description
-    - Presence of Free Food or Free Items (Yes/No and what it is)
-    - Category (Career, Academic, Social, etc.)
-
-    Filter this list for "High Interest" events based on these criteria:
-{_criteria_block("    ")}
-
-    Content scraped from VT:
-    {vt_content}
-
-    OUTPUT FORMAT:
-    You MUST return your response as a valid JSON object ONLY. Do not include conversational text.
-    Structure:
-    {{
-      "all_events": [
-        {{"title": "...", "time": "...", "location": "...", "description": "...", "free_stuff": "...", "category": "..."}}
-      ],
-      "filtered_events": [
-        {{"title": "...", "time": "...", "location": "...", "description": "...", "free_stuff": "...", "category": "...", "reason": "why it matched interest"}}
-      ]
-    }}
-    """
 
 def strip_emojis(text):
     """Remove emoji characters from a string."""
@@ -981,84 +1206,199 @@ def _normalize_text(text):
     """
     return " ".join(re.sub(r"[^a-z0-9\s]", "", (text or "").lower()).split())
 
-def create_local_html(all_events, sources=None):
-    today_str = datetime.now().strftime("%B %d, %Y")
-    norm_sources = {url: _normalize_text(text) for url, text in (sources or {}).items()}
-    fallback_url = "https://events.vt.edu/"
-    html_content = f"""
-    <html>
-    <head>
-        <title>VT Events - {today_str}</title>
-        <style>
-            body {{ font-family: sans-serif; margin: 20px; background-color: #f4f4f4; }}
-            .container {{ max-width: 900px; margin: auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }}
-            h1 {{ color: #630031; border-bottom: 2px solid #cf4420; padding-bottom: 10px; }}
-            .event-card {{ border-bottom: 1px solid #ddd; padding: 15px 0; }}
-            .event-card:last-child {{ border-bottom: none; }}
-            .title {{ font-size: 1.2em; font-weight: bold; color: #cf4420; }}
-            .meta {{ color: #555; font-size: 0.9em; margin-bottom: 5px; }}
-            .free-food {{ background-color: #e8f5e9; color: #2e7d32; padding: 2px 6px; border-radius: 4px; font-weight: bold; font-size: 0.85em; }}
-            .source-link {{ color: #1565c0; font-size: 0.8em; text-decoration: none; margin-left: 8px; }}
-            .source-link:hover {{ text-decoration: underline; }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>VT Campus Events - {today_str}</h1>
-            <p>Total Events Found: {len(all_events)}</p>
+def _e(value):
+    """Escape for HTML, after stripping emojis. Never interpolate raw text.
+
+    Everything rendered here is either scraped from the web or written by a
+    model, so it is untrusted: an unescaped '&' mangles the page and an
+    unescaped tag in a title would inject script into the served report.
     """
-    for ev in all_events:
-        free_stuff_raw = ev.get("free_stuff")
-        free_stuff = strip_emojis(free_stuff_raw) or ""
-        has_free_stuff = bool(free_stuff_raw) and not (
-            isinstance(free_stuff_raw, str) and "no" in free_stuff_raw.lower()
-        ) and not (
-            isinstance(free_stuff_raw, dict) and all(
-                str(v).lower().strip() in ("no", "false", "none", "") for v in free_stuff_raw.values()
-            )
-        )
-        free_stuff_html = f'<span class="free-food">{free_stuff}</span>' if has_free_stuff else ""
-        title = strip_emojis(ev.get("title")) or ""
-        time_val = strip_emojis(ev.get("time")) or ""
-        location = strip_emojis(ev.get("location")) or ""
-        description = strip_emojis(ev.get("description")) or ""
+    return html.escape(strip_emojis(value) or "", quote=True)
 
-        source_url = fallback_url
-        norm_title = _normalize_text(title)
-        if norm_title:
-            for url, norm_section in norm_sources.items():
-                if norm_title in norm_section:
-                    source_url = url
-                    break
-        source_html = f'<a class="source-link" href="{source_url}" target="_blank">Source</a>'
 
-        html_content += f"""
-        <div class="event-card">
-            <div class="title">{title} {free_stuff_html} {source_html}</div>
-            <div class="meta"><strong>Time:</strong> {time_val} | <strong>Location:</strong> {location}</div>
-            <div class="description">{description}</div>
-        </div>
-        """
-    html_content += "</div></body></html>"
-    with open(HTML_FILE_PATH, "w") as f: f.write(html_content)
+_DAY_FMT = "%A, %B %d"
 
-def send_filtered_email(filtered_events):
-    if not filtered_events:
-        report_body = "No specific high-interest events found for today."
+
+def group_by_day(events, week_start, week_end):
+    """Group events into (heading, [events]) pairs, in calendar order.
+
+    Possible only because `dates` is parsed by the scraper rather than restated
+    as free text by a model. Anything without a usable date -- news notices --
+    lands in a trailing group that says so.
+    """
+    buckets = {}
+    ongoing, undated = [], []
+    for event in events:
+        in_week = [d for d in event.dates if week_start <= d <= week_end]
+        if in_week:
+            buckets.setdefault(min(in_week), []).append(event)
+        elif event.dates:
+            # A run that starts before Monday and ends after Sunday. Filing it
+            # under its start date would date the report to a week it is not in.
+            ongoing.append(event)
+        else:
+            undated.append(event)
+    groups = [(day.strftime(_DAY_FMT), buckets[day]) for day in sorted(buckets)]
+    if ongoing:
+        groups.append(("Ongoing this week", ongoing))
+    if undated:
+        groups.append(("Undated notices", undated))
+    return groups
+
+
+def create_local_html(events, week_start, week_end, path):
+    today_str = datetime.now().strftime("%B %d, %Y")
+    starred = high_interest(events)
+    criteria_by_n = {c["n"]: c["text"] for c in INTEREST_CRITERIA}
+
+    parts = [f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VT Events - {_e(today_str)}</title>
+<style>
+  :root {{ color-scheme: light dark; --ground:#f4f2f2; --card:#fff; --ink:#1a1315;
+           --ink2:#5f5257; --rule:#e0d6d8; --maroon:#630031; --orange:#cf4420;
+           --good:#2c6a4e; --goodbg:#e8f5ee; }}
+  @media (prefers-color-scheme: dark) {{
+    :root {{ --ground:#151011; --card:#1d1719; --ink:#efe8ea; --ink2:#a4939a;
+             --rule:#352a2d; --maroon:#db8fae; --orange:#f0834f;
+             --good:#6fc79b; --goodbg:#1d2f27; }}
+  }}
+  body {{ font-family: system-ui, -apple-system, "Segoe UI", sans-serif; margin:0;
+          background: var(--ground); color: var(--ink); line-height:1.55; }}
+  .container {{ max-width: 900px; margin: 0 auto; padding: 24px 20px 64px; }}
+  h1 {{ color: var(--maroon); border-bottom: 2px solid var(--orange);
+        padding-bottom: 10px; margin: 0 0 6px; font-size: 1.7rem; }}
+  .summary {{ color: var(--ink2); margin: 0 0 28px; font-size: .95rem; }}
+  h2 {{ font-size: 1rem; text-transform: uppercase; letter-spacing: .08em;
+        color: var(--ink2); margin: 34px 0 10px; font-weight: 600; }}
+  .event-card {{ background: var(--card); border: 1px solid var(--rule);
+                 border-radius: 6px; padding: 14px 16px; margin-bottom: 10px; }}
+  .event-card.high {{ border-left: 4px solid var(--maroon); }}
+  .title {{ font-size: 1.05rem; font-weight: 600; color: var(--orange); }}
+  .title a {{ color: inherit; text-decoration: none; }}
+  .title a:hover, .title a:focus-visible {{ text-decoration: underline; }}
+  .meta {{ color: var(--ink2); font-size: .87rem; margin-top: 2px; }}
+  .description {{ font-size: .92rem; margin-top: 6px; }}
+  .tag {{ display: inline-block; font-size: .75rem; font-weight: 600;
+          border-radius: 4px; padding: 1px 7px; margin-left: 6px;
+          vertical-align: middle; }}
+  .tag.free {{ background: var(--goodbg); color: var(--good); }}
+  .tag.high {{ background: var(--maroon); color: var(--ground); }}
+  .why {{ font-size: .84rem; color: var(--ink2); margin-top: 5px; font-style: italic; }}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>VT Campus Events - {_e(today_str)}</h1>
+<p class="summary">{len(events)} events for
+{_e(week_start.strftime("%B %d"))} - {_e(week_end.strftime("%B %d, %Y"))} &middot;
+{len(starred)} match your interests</p>
+"""]
+
+    for heading, group in group_by_day(events, week_start, week_end):
+        parts.append(f'<h2>{_e(heading)}</h2>\n')
+        for ev in group:
+            classes = "event-card high" if ev.matches else "event-card"
+            title = _e(ev.title)
+            if ev.link:
+                title = (f'<a href="{html.escape(ev.link, quote=True)}" '
+                         f'target="_blank" rel="noopener">{title}</a>')
+            tags = ""
+            if ev.matches:
+                why = "; ".join(criteria_by_n.get(n, str(n)) for n in ev.matches)
+                tags += f'<span class="tag high">{_e(why)}</span>'
+            if ev.free_stuff and ev.free_stuff != "undated":
+                tags += f'<span class="tag free">{_e(ev.free_stuff)}</span>'
+            meta = " &middot; ".join(_e(v) for v in (ev.when, ev.location, ev.host) if v)
+            parts.append(f'<div class="{classes}">'
+                         f'<div class="title">{title}{tags}</div>'
+                         + (f'<div class="meta">{meta}</div>' if meta else "")
+                         + (f'<div class="description">{_e(ev.description[:400])}</div>'
+                            if ev.description else "")
+                         + (f'<div class="why">{_e(ev.reason)}</div>' if ev.reason else "")
+                         + "</div>\n")
+
+    parts.append("</div>\n</body>\n</html>\n")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("".join(parts))
+
+
+def _email_bodies(starred, report_link):
+    """Render the digest as (plain text, html) for a multipart/alternative send."""
+    criteria_by_n = {c["n"]: c["text"] for c in INTEREST_CRITERIA}
+    if not starred:
+        text = "No high-interest events found this week."
+        body_html = "<p>No high-interest events found this week.</p>"
     else:
-        report_body = "The following events matched your interests:\n\n"
-        for ev in filtered_events:
-            report_body += f"--- {ev.get('title') or ''} ---\n"
-            report_body += f"Time: {ev.get('time') or ''} | Location: {ev.get('location') or ''}\n"
-            report_body += f"Reason: {ev.get('reason') or ''}\n"
-            report_body += f"Free Stuff: {ev.get('free_stuff') or ''}\n\n"
+        lines = ["The following events matched your interests:", ""]
+        cards = []
+        for ev in starred:
+            why = ev.reason or "; ".join(criteria_by_n.get(n, str(n)) for n in ev.matches)
+            title = strip_emojis(ev.title)
+            when = strip_emojis(ev.when)
+            location = strip_emojis(ev.location)
+            lines += [f"--- {title} ---",
+                      f"When: {when or 'see listing'} | Where: {location or 'see listing'}",
+                      f"Why: {strip_emojis(why)}"]
+            if ev.free_stuff:
+                lines.append(f"Free: {strip_emojis(ev.free_stuff)}")
+            if ev.link:
+                lines.append(ev.link)
+            lines.append("")
+            heading = (f'<a href="{html.escape(ev.link, quote=True)}" '
+                       f'style="color:#cf4420;text-decoration:none">{_e(ev.title)}</a>'
+                       if ev.link else _e(ev.title))
+            cards.append(
+                '<div style="margin:0 0 18px 0">'
+                f'<div style="font-weight:600;font-size:16px">{heading}</div>'
+                + (f'<div style="color:#555;font-size:14px">'
+                   f'{_e(when)}{" &middot; " if when and location else ""}'
+                   f'{_e(location)}</div>' if (when or location) else "")
+                + f'<div style="font-size:14px">{_e(why)}</div>'
+                + (f'<div style="font-size:14px;color:#2c6a4e"><strong>Free:</strong> '
+                   f'{_e(ev.free_stuff)}</div>' if ev.free_stuff else "")
+                + '</div>')
+        text = "\n".join(lines)
+        body_html = ("<p>The following events matched your interests:</p>"
+                     + "".join(cards))
 
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    message = f"Subject: VT High Interest Events - {today_str}\n\n{report_body}\nFull list: {HTML_FILE_PATH}" + (f" or at {REPORT_URL}" if REPORT_URL else "")
-    
+    if report_link:
+        text += f"\n\nFull list: {report_link}"
+        if report_link.startswith("http"):
+            link_html = (f'<p><a href="{html.escape(report_link, quote=True)}">'
+                         f'Full list of events</a></p>')
+        else:
+            link_html = f"<p>Full list: {_e(report_link)}</p>"
+    else:
+        link_html = ""
+    body_html = (f'<html><body style="font-family:system-ui,sans-serif">'
+                 f'{body_html}{link_html}</body></html>')
+    return text, body_html
+
+
+def send_filtered_email(starred, report_link):
+    """Send the digest as a proper MIME message.
+
+    This used to be a hand-built "Subject: ...\n\n..." string with no headers
+    and no declared charset, so any non-ASCII character in a VT event title
+    reached the client as mojibake and the message had no To:/From:.
+    """
+    text, body_html = _email_bodies(starred, report_link)
+
+    message = EmailMessage()
+    message["Subject"] = f"VT High Interest Events - {datetime.now():%Y-%m-%d}"
+    message["From"] = SENDER_EMAIL
+    message["To"] = ", ".join(RECIPIENTS)
+    message.set_content(text)
+    message.add_alternative(body_html, subtype="html")
+
     with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=CONTEXT) as server:
         server.login(SENDER_EMAIL, PASSWORD)
-        server.sendmail(SENDER_EMAIL, RECEIVER_EMAIL, message.encode('utf-8'))
+        server.send_message(message)
+
 
 def extract_json(raw_response):
     raw_response = raw_response.strip()
@@ -1086,108 +1426,129 @@ def extract_json(raw_response):
 
 
 
-if __name__ == "__main__":
-    # --dry-run exercises the whole pipeline but sends no email and writes the
-    # report beside the real one, so a supervised run cannot clobber it.
-    DRY_RUN = "--dry-run" in sys.argv
-    if DRY_RUN:
-        HTML_FILE_PATH = HTML_FILE_PATH.replace(".html", "_dryrun.html")
-        print(f"*** DRY RUN: no email will be sent; report -> {HTML_FILE_PATH}")
+def _flag_value(name, default=None):
+    """Value of a `--flag value` command-line argument."""
+    if name in sys.argv:
+        i = sys.argv.index(name)
+        if i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return default
+
+
+def save_scrape(path, events):
+    """Write a scrape to disk so later runs can replay it without refetching."""
+    payload = {"saved_at": datetime.now().isoformat(),
+               "events": [_event_to_dict(e) for e in events]}
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+    _stamp(f"SCRAPE  saved {len(events)} events to {path} (replay with --from-scrape)")
+
+
+def _event_to_dict(event):
+    data = asdict(event)
+    data["dates"] = [d.isoformat() for d in event.dates]
+    return data
+
+
+def _event_from_dict(data):
+    data = dict(data)
+    data["dates"] = [date.fromisoformat(d) for d in data.get("dates") or []]
+    return Event(**data)
+
+
+def load_scrape(path):
+    """Replay a saved scrape. Iterating on prompts or the report otherwise costs
+    a full refetch; combined with --no-llm it makes a change testable in
+    seconds instead of hours."""
+    with open(path, encoding="utf-8") as fh:
+        payload = json.load(fh)
+    events = [_event_from_dict(d) for d in payload["events"]]
+    _stamp(f"SCRAPE  replayed {len(events)} events from {path} "
+           f"(captured {payload.get('saved_at')})")
+    return events
+
+
+def main():
+    argv = sys.argv
+    dry_run = "--dry-run" in argv
+    no_llm = "--no-llm" in argv
+    from_scrape = _flag_value("--from-scrape")
+    save_path = _flag_value("--save-scrape")
+    if no_llm:
+        dry_run = True
+
+    want_html = OUTPUT_MODE in ("html", "html+email")
+    want_email = OUTPUT_MODE in ("email", "html+email") and not dry_run
+
+    html_path = HTML_FILE_PATH
+    if dry_run:
+        html_path = html_path.replace(".html", "_dryrun.html")
+        print(f"*** DRY RUN: no email will be sent"
+              + (f"; report -> {html_path}" if want_html else ""))
+
+    # A missing password used to surface only at send time, hours after the work
+    # was done. Fail before spending any of it.
+    if want_email and not PASSWORD:
+        sys.exit("PASSWORD is not set in .env -- the email would fail after the "
+                 "whole pipeline ran. Set it, or use --dry-run, or set "
+                 "output.mode to \"html\".")
 
     t0 = time.time()
     today = datetime.now().strftime("%A, %B %d, %Y")
-    print("Today is "+today)
-    data, sources = get_vt_data()
+    week_start, week_end = week_bounds()
+    print(f"Today is {today}")
+    print(f"Output mode: {OUTPUT_MODE}"
+          + ("" if want_email else " (no email this run)"))
 
-    week_end_str = week_bounds()[1].strftime("%A, %B %d, %Y")
-    # The deterministic completeness check only applies to the builtin scrape
-    # (which produces "TITLE:" blocks). In web_search mode the worker browses
-    # sources itself, so there is nothing to count against.
-    expected = count_source_events(data) if SCRAPE_MODE == "builtin" else None
-    print(f"Scraped content contains {expected} event blocks." if expected is not None
-          else "Web-search scrape mode -- no local event-block count.")
+    events = load_scrape(from_scrape) if from_scrape else get_vt_data()
+    if save_path:
+        save_scrape(save_path, events)
+    if not events:
+        print("No events collected. Nothing to report.")
 
-    # --- Worker phase ---
-    events = None
-    attempts = 0
-    while events is None:
-        try:
-            raw_response = worker_call(get_prompt(data, today))
-            raw_response = extract_json(raw_response)
-            events = json.loads(raw_response)
-        except Exception as e:
-            attempts += 1
-            print(f"Worker attempt {attempts} failed: {e}. Retrying in 5s...")
-            time.sleep(5)
-    print(f"[Worker] extracted {len(events.get('all_events', []))} events, "
-          f"{len(events.get('filtered_events', []))} high-interest.")
-
-    # --- Judge phase: 0, 1, or 2 independent reviewers, report-only ---
-    if NUM_JUDGES > 0:
-        judge_specs = [JUDGE1_SPEC]
-        if NUM_JUDGES == 2:
-            judge_specs.append(JUDGE2_SPEC)
-        reports = []
-        for spec in judge_specs:
-            judge_model = spec.get("model")
-            try:
-                reports.append(run_judge(spec, data, events, today, week_end_str))
-                print(f"[Judge {judge_model}] reported.")
-            except Exception as e:
-                # A judge that fails is simply absent; unanimity is then computed
-                # over the judges that did respond, and the run still completes.
-                print(f"[Judge {judge_model}] failed ({e}). Continuing without it.")
-
-        if reports:
-            verdict = merge_judgements(reports)
-            for key in ("missing_events", "should_be_filtered", "wrongly_included"):
-                for item in verdict[key]:
-                    print(f"[Verdict] {key}: {item}")
-            for item in verdict["contested_removals"]:
-                print(f"[Verdict] contested (kept, reviewers disagreed): {item}")
-
-            critique = build_critique(verdict, expected, len(events.get("all_events", [])))
-            if critique:
-                print("Reviewers found issues. Asking worker once for the missing events...")
-                existing_titles = [e.get("title") for e in events.get("all_events", [])
-                                   if e.get("title")]
-                try:
-                    raw_response = worker_call(
-                        get_revision_prompt(data, today, critique, existing_titles))
-                    revision = json.loads(extract_json(raw_response))
-                    if revision.get("new_events") or revision.get("new_filtered"):
-                        events, summary = apply_revision(events, revision, verdict)
-                        print(f"[Revision] {summary} -> {len(events['all_events'])} events, "
-                              f"{len(events.get('filtered_events', []))} high-interest.")
-                    else:
-                        print("Revision found nothing to add. Keeping original worker output.")
-                except Exception as e:
-                    print(f"Revision failed ({e}). Keeping original worker output.")
-            else:
-                print("Reviewers approved the worker output.")
-        else:
-            print("No judge succeeded. Proceeding with original worker output.")
+    # --- Classification ---
+    if no_llm:
+        for event in events:
+            event.matches = auto_matches(event)
+            if event.matches:
+                event.reason = "flagged by the source: " + event.free_stuff
+        print(f"*** --no-llm: no model called; {len(high_interest(events))} "
+              f"high-interest from source flags alone.")
     else:
-        print(f"Skipping judge phase ({NUM_JUDGES} judges configured).")
+        run_classification(events, today, week_end.strftime("%A, %B %d, %Y"))
 
-    # The HTML report is written before any send-window hold, so the full list
-    # is on disk and servable the moment the pipeline finishes, even while the
-    # email itself is still waiting for 08:00.
-    create_local_html(events.get("all_events", []), sources)
-    _stamp(f"REPORT  written to {HTML_FILE_PATH}")
+    starred = high_interest(events)
+    print(f"[Result] {len(events)} events, {len(starred)} high-interest.")
 
-    filtered = events.get("filtered_events", [])
-    if DRY_RUN:
-        print(f"\n*** DRY RUN: skipping email. Would have sent {len(filtered)} "
-              f"high-interest event(s) to {RECEIVER_EMAIL}:")
-        for ev in filtered:
-            print(f"  - {ev.get('title')} | {ev.get('time')} | {ev.get('reason')}")
-        print(f"*** Report written to {HTML_FILE_PATH}")
-        _stamp("EMAIL   dry run -- send window not applied")
+    # The report is written before any send-window hold, so the full list is on
+    # disk and servable the moment the pipeline finishes, even while the email
+    # is still waiting for 08:00.
+    report_link = ""
+    if want_html:
+        create_local_html(events, week_start, week_end, html_path)
+        _stamp(f"REPORT  written to {html_path}")
+        report_link = REPORT_URL or html_path
     else:
+        _stamp("REPORT  skipped (output.mode does not include html)")
+
+    if want_email:
         disposition = wait_for_send_window()
         _stamp(f"EMAIL   {disposition}")
-        send_filtered_email(filtered)
-        _stamp(f"EMAIL   sent {len(filtered)} high-interest event(s) to {RECEIVER_EMAIL}")
+        send_filtered_email(starred, report_link)
+        _stamp(f"EMAIL   sent {len(starred)} high-interest event(s) to "
+               f"{', '.join(RECIPIENTS)}")
+    elif dry_run and OUTPUT_MODE in ("email", "html+email"):
+        print(f"\n*** DRY RUN: skipping email. Would have sent {len(starred)} "
+              f"high-interest event(s) to {', '.join(RECIPIENTS)}:")
+        for ev in starred:
+            print(f"  - {ev.title} | {ev.when} | {ev.reason}")
+        _stamp("EMAIL   dry run -- send window not applied")
+    else:
+        _stamp("EMAIL   skipped (output.mode does not include email)")
+
     elapsed = time.time() - t0
     _stamp(f"FINISH  done in {elapsed/60:.1f} min ({elapsed:.0f}s)")
+
+
+if __name__ == "__main__":
+    main()

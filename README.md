@@ -1,15 +1,28 @@
 # EventScraper (VT Event Reminders)
 
-Scrapes Virginia Tech event/notice pages and GobblerConnect, runs the content
-through an LLM pipeline to extract and rank events, writes a local HTML report,
-and emails high-interest matches via Gmail SMTP.
+Scrapes Virginia Tech event/notice pages and GobblerConnect into structured
+records, asks an LLM which of them match your interests, writes a local HTML
+report, and emails the matches via Gmail SMTP.
 
-The pipeline uses up to three model roles, and each can be a **different
-provider** or the **same provider**:
+**Extraction is deterministic.** Each source has a dedicated parser, and what
+those parsers produce *is* the event list — no model is involved in deciding
+which events exist, when they are, or whether the source advertises free food.
+That last one is read from the listing's own CSS facets, so it is a fact rather
+than an inference.
 
-- **Worker** — extracts the event list from the scraped content.
-- **Judge 1** — reviews the worker's output for completeness/correctness.
-- **Judge 2** — a second, independent reviewer (optional).
+The model is asked exactly one question, a batch of events at a time: *which of
+these interest criteria does this event match?* It answers with a couple of
+digits per event.
+
+Up to three reviewers vote on that question, each of which can be a
+**different provider** or the same one:
+
+- **Worker** — classifies every event.
+- **Judge 1 / Judge 2** — optional independent second and third opinions.
+
+Reviewers vote by **union**: an event is high-interest if any of them says it
+matches. Missing a free-food event is the failure that matters; an extra line in
+the digest costs nothing.
 
 Supported providers: **Ollama** (local/free), **Gemini**, **Claude**
 (Anthropic), and **OpenAI**.
@@ -24,7 +37,14 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Copy `config.json`/`.env` to taste (see below), then run:
+`config.json` is git-ignored because it holds your email addresses and server
+IP. Start from the tracked example:
+
+```bash
+cp config.example.json config.json   # then edit it (see below)
+```
+
+Create `.env` next to it for the secrets, then run:
 
 ```bash
 python vt_events_reminder.py            # normal run
@@ -35,6 +55,28 @@ python vt_events_reminder.py --config other/config.json  # use another config
 The `CONFIG_PATH` env var and the `--config` flag both point at a different
 config file. Secrets are read from a `.env` file next to the config (or from
 `DOTENV_PATH`).
+
+### Iterating without waiting for a full run
+
+A real run is dominated by model generation and can take hours, which makes it
+a terrible way to test a prompt tweak or a change to the report. These three
+flags cut the loop to under a second:
+
+```bash
+# Scrape once, keep the result.
+python vt_events_reminder.py --dry-run --save-scrape scrape.json
+
+# Replay that scrape instead of refetching every source.
+python vt_events_reminder.py --dry-run --from-scrape scrape.json
+
+# Replay it AND skip every model call, building the event list straight from
+# the scraped blocks. Exercises prompts, merging, the report and the email
+# body end to end with no LLM.
+python vt_events_reminder.py --no-llm --from-scrape scrape.json
+```
+
+`--no-llm` implies `--dry-run`: no email is sent and the report is written
+beside the real one as `*_dryrun.html`.
 
 ---
 
@@ -67,8 +109,14 @@ Each of `worker`, `judge1`, `judge2` is a dict:
 ```jsonc
 "stages": {
   "use_same_model_for_all": false,   // true => judge1/judge2 reuse the worker model
-  "num_judges": 2,                    // 0, 1, or 2 reviewers
-  "judge_thinking": {                 // Ollama only: per-model reasoning on/off
+  "num_judges": 2,                    // 0, 1, or 2 extra reviewers
+  "classify_batch_size": 25,          // events per model call
+  "classify_detail_limit": 400,       // chars of description sent per event
+  "call_max_attempts": 3,             // retries per model call
+  "call_backoff_seconds": 5,          // doubles each retry
+  "cloud_timeout_seconds": 180,       // per-request timeout (cloud providers)
+  "max_tokens": 8192,                 // reply cap (cloud providers)
+  "model_thinking": {                 // Ollama only: per-model reasoning on/off
     "muse-glimmer:30b": false,
     "qwen3.8:27b": false
   }
@@ -78,29 +126,43 @@ Each of `worker`, `judge1`, `judge2` is a dict:
 - **`use_same_model_for_all`** — when `true`, you only need to configure
   `models.worker`; the judges use it too. Set `false` to give each stage its
   own provider/model.
-- **`num_judges`** — `0` runs the worker only (fastest, no review), `1` runs a
-  single judge, `2` runs two independent judges. Defaults to `2`.
+- **`num_judges`** — `0` runs the worker alone (fastest), `1` or `2` add
+  independent reviewers whose matches are unioned with the worker's. Defaults
+  to `2`. Each judge costs a full pass over every batch, so on a local box this
+  is the main quality-versus-time dial.
+- **`classify_batch_size`** — events per model call. Larger batches mean fewer
+  calls but a longer reply to keep coherent; 25 is a good default. A batch whose
+  reply cannot be parsed is skipped, so the blast radius of one bad reply is
+  that batch, not the run.
+- **`classify_detail_limit`** — how much of each event's description reaches the
+  prompt. The interest decision rarely needs more than the first couple of
+  sentences, and this is the single biggest lever on prefill cost.
+- **`call_max_attempts` / `call_backoff_seconds`** — retry policy for every
+  model call, with exponential backoff. Errors that a retry cannot fix (unknown
+  model, bad API key, a model that rejects `think`) are detected and not
+  retried.
+- **`model_thinking`** — Ollama reasoning on/off per model. A model **absent
+  from this map keeps Ollama's own default**, which is what makes models with no
+  reasoning mode work at all. `judge_thinking` is still read as an alias.
 
 ### Scraping — `scraping` section
 
 ```jsonc
 "scraping": {
-  "mode": "builtin",   // "builtin" | "web_search"
+  "mode": "builtin",        // the only supported mode
+  "include_undated": true,  // keep news notices that carry no date
   ...
 }
 ```
 
-- **`builtin`** — the script fetches each URL in `sources.json` with the
-  built-in `requests` + BeautifulSoup parsers and produces structured blocks.
-  Use this for **local (Ollama)** workers, which have no built-in web search.
-- **`web_search`** — the script hands the list of source URLs to the worker
-  model, which uses **its own web-search/browsing tools** to look them up
-  itself. Use this for **cloud providers** (Gemini, OpenAI, Claude) that expose
-  a model-side search tool. In this mode the deterministic completeness check
-  and block counting are skipped (there is no local content to count).
-
-> A good rule of thumb: if the worker provider is Ollama, use `builtin`; if the
-> worker is a paid/cloud provider with web-search, use `web_search`.
+- **`mode`** must be `"builtin"`. The old `"web_search"` mode asked a cloud
+  model to browse the sources and report what it found — that is model-driven
+  extraction, which this pipeline no longer does at all. The config is rejected
+  with an explanation rather than silently ignored.
+- **`include_undated`** — `news.vt.edu` notices carry no date in the listing
+  markup, so unlike every other source they cannot be week-filtered. Keep them
+  (they land in an "Undated notices" group in the report) or set this to `false`
+  to drop them.
 
 ### Ollama tuning — `ollama` section
 
@@ -109,22 +171,25 @@ Each of `worker`, `judge1`, `judge2` is a dict:
   "num_ctx": 32768,   // context window (tokens)
   "num_gpu": 0,       // -1=all, 0=CPU-only, N=use N GPU layers
   "num_thread": 10,   // inference threads
-  "model_unload_grace_seconds": 600
+  "model_unload_grace_seconds": 600,  // ceiling on the model-swap wait
+  "unload_poll_seconds": 10           // how often to check whether it is gone
 }
 ```
 
 - `num_ctx`, `num_gpu`, and `num_thread` only apply to Ollama.
-- `model_unload_grace_seconds` is the sleep before swapping between different
-  Ollama models so the previous model is evicted from RAM. **0 seconds is ideal
-  for paid/cloud providers** (no local process to unload); **~600 seconds
-  (10 min) is good for Ollama** unloading large local models.
+- `model_unload_grace_seconds` is now a **ceiling, not a fixed cost**. Every
+  call passes `keep_alive=0`, so on a model swap the script polls `ollama ps`
+  every `unload_poll_seconds` and continues as soon as the previous model has
+  actually left RAM — usually seconds. It only waits the full grace if
+  `ollama ps` cannot be reached. Set it to `0` for cloud providers, where there
+  is nothing to unload.
 
 ### Email — `email` section
 
 ```jsonc
 "email": {
   "sender_email": "you@gmail.com",
-  "receiver_email": "you@vt.edu",
+  "receiver_email": "you@vt.edu",   // or a list: ["a@x.edu", "b@y.edu"]
   "smtp_server": "smtp.gmail.com",
   "smtp_port": 465,
   "send_hour_start": 8,
@@ -133,7 +198,12 @@ Each of `worker`, `judge1`, `judge2` is a dict:
 ```
 
 The digest is only emailed inside this window; runs finishing earlier hold until
-`send_hour_start`. Set `PASSWORD` (a Gmail app password) in `.env`.
+`send_hour_start`. Set `PASSWORD` (a Gmail app password) in `.env` — the script
+exits at startup if it is missing, rather than discovering it hours later.
+
+`receiver_email` takes a single address or a list. The digest is sent as a
+`multipart/alternative` message (plain text plus HTML) with an explicit UTF-8
+charset, so accented characters and en-dashes in VT event titles arrive intact.
 
 ### Report — `report` section
 
@@ -151,17 +221,53 @@ full report.
 
 ---
 
+### Output — `output` section
+
+```jsonc
+"output": {
+  "mode": "html+email"   // "html" | "email" | "html+email"
+}
+```
+
+Which outputs a run produces:
+
+| mode | HTML report | Email | Notes |
+| --- | --- | --- | --- |
+| `html` | written | — | No send-window wait; the run ends as soon as the report is on disk. |
+| `email` | — | sent | The digest carries no "full list" link, because no report exists to link to. |
+| `html+email` | written | sent | Default. The report is written *before* the send-window hold, so it is servable immediately. |
+
+`both` is accepted as an alias for `html+email`. An unrecognized value exits
+with an explanation rather than guessing. `--dry-run` suppresses the email in
+any mode.
+
 ## Interests file
 
 `interests.json` (path set via `files.interests`) lists the "high interest"
 criteria that determine what lands in the email:
 
 ```json
-{ "criteria": [ "Offers free food or free items", "...more..." ] }
+{
+  "criteria": [
+    { "text": "Offers free food or free items",
+      "auto_match_flags": ["FREE FOOD", "FREE ITEMS / GIVEAWAYS"] },
+    "Career / job fairs or recruiting events"
+  ]
+}
 ```
 
-These are rendered verbatim into both the worker and judge prompts. Edit this
-one list to change what counts as high-interest.
+A criterion is either a plain string or an object. Both forms can be mixed, and
+the criteria are numbered in order — that numbering is what the model returns,
+so a reply is a couple of digits per event instead of a restatement.
+
+- **`text`** — the criterion, rendered verbatim into every reviewer's prompt.
+- **`auto_match_flags`** *(optional)* — facets the source states outright. An
+  event carrying one of these flags matches **without a model call**:
+  events.vt.edu publishes free food and giveaways as CSS classes on its listing,
+  so that is a fact to read, not a judgement to make. Currently emitted flags
+  are `FREE FOOD`, `FREE ITEMS / GIVEAWAYS`, `free parking` and `free admission`.
+
+Edit this one list to change what counts as high-interest.
 
 ## Sources file
 
@@ -207,8 +313,8 @@ The API key is ignored. `scraping.mode` should be `builtin`.
             "api_key_env": "GEMINI_API_KEY", "model": "gemini-2.0-flash" }
 ```
 
-Set `GEMINI_API_KEY` in `.env`. Gemini exposes a Google-search tool, so
-`scraping.mode: "web_search"` lets it look up the sources itself.
+Set `GEMINI_API_KEY` in `.env`. Uses the current `google-genai` SDK
+(`pip install google-genai`) with `response_mime_type: application/json`.
 
 ### OpenAI
 
@@ -217,8 +323,8 @@ Set `GEMINI_API_KEY` in `.env`. Gemini exposes a Google-search tool, so
             "api_key_env": "OPENAI_API_KEY", "model": "gpt-4o" }
 ```
 
-Set `OPENAI_API_KEY` in `.env`. Use `scraping.mode: "web_search"` for models
-that have web browsing; otherwise provide content another way.
+Set `OPENAI_API_KEY` in `.env`. Classification requests use
+`response_format: {"type": "json_object"}`.
 
 ### Claude (Anthropic)
 
@@ -228,10 +334,25 @@ that have web browsing; otherwise provide content another way.
 ```
 
 Set `ANTHROPIC_API_KEY` in `.env`. `provider` may be `"claude"` or
-`"anthropic"` — both are accepted.
+`"anthropic"` — both are accepted. JSON replies use assistant prefill.
 
 Any of the four providers can be used for the worker *and/or* the judges, and
 they may be mixed (e.g. an Ollama worker with a Gemini judge).
+
+### Local vs. cloud
+
+Both paths are first class, tuned for opposite constraints:
+
+| | Ollama | Cloud |
+| --- | --- | --- |
+| Model swaps | `ollama ps` polled until the old model leaves RAM | nothing to unload — set the grace to `0` |
+| JSON | Ollama's `format: json` constrained sampling | native JSON mode per provider |
+| Reasoning | `model_thinking` per model | provider default |
+| Failures | retried with backoff | retried with backoff, plus a per-request timeout |
+
+A run's cost is dominated by generated tokens, and classification generates a
+few hundred per batch regardless of backend — so the same config that takes
+under an hour locally takes a couple of minutes on a cloud provider.
 
 ---
 
