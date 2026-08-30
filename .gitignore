@@ -1,6 +1,10 @@
 # Secrets -- never commit
 .env
 
+# Local config (holds your email addresses and server IP).
+# Copy config.example.json to config.json and edit it.
+config.json
+
 # Run logs
 *.log
 log.txt
@@ -16,3 +20,9 @@ __pycache__/
 
 # Generated reports
 *vt_events_all*.html
+
+# Agent instruction files (kept local)
+AGENTS.md
+agents.md
+CLAUDE.md
+claude.md
