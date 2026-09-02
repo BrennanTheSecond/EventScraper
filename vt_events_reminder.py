@@ -1113,13 +1113,17 @@ def _parse_classification(raw, batch_size, start_index):
     return parsed
 
 
-def classify(events, provider, today, week_end, label):
+def classify(events, provider, today, week_end, label, keep_after=False):
     """Classify every event with one model, a batch at a time.
 
     Returns {index: (matches, reason)}. A batch whose reply never parses is
     skipped rather than aborting the run -- the cost of a bad batch is 25
     events falling back to whatever the other reviewers said, not the loss of
     the whole night's work.
+
+    `keep_after` says the next reviewer will run this very same local model, so
+    even the last batch should leave it in RAM. Unloading it there would buy
+    nothing and cost the next stage a full cold load.
     """
     results = {}
     total = (len(events) + CLASSIFY_BATCH_SIZE - 1) // CLASSIFY_BATCH_SIZE
@@ -1131,8 +1135,10 @@ def classify(events, provider, today, week_end, label):
             raw = call_model(provider, prompt, want_json=True,
                              thinking=_thinking_for(provider), label=tag,
                              # Hold the model in RAM until this reviewer's last
-                             # batch, then let it go so the next stage can load.
-                             keep_loaded=batch_no < total)
+                             # batch, then let it go so the next stage can load
+                             # -- unless the next stage is the same model, in
+                             # which case there is nothing to make room for.
+                             keep_loaded=batch_no < total or keep_after)
             parsed = _parse_classification(raw, len(batch), start)
         except Exception as e:
             print(f"[{tag}] failed ({e}). Skipping this batch.")
@@ -1158,6 +1164,18 @@ def _thinking_for(provider):
     return MODEL_THINKING.get(provider.model)
 
 
+def _same_local_model(a, b):
+    """True when two reviewers would put the exact same model in the same RAM.
+
+    Only Ollama has a model to evict, and only a *different* Ollama model needs
+    evicting: two stages pointing at one model on one server share the load, so
+    neither the unload wait nor the reload is real work.
+    """
+    if not (isinstance(a, OllamaProvider) and isinstance(b, OllamaProvider)):
+        return False
+    return (a.model, a.url) == (b.model, b.url)
+
+
 def run_classification(events, today, week_end):
     """Fill in `matches`/`reason` on every event.
 
@@ -1178,15 +1196,30 @@ def run_classification(events, today, week_end):
     if NUM_JUDGES >= 2:
         specs.append(("judge2", JUDGE2_SPEC))
 
-    reviewed = 0
+    # Build every reviewer up front (make_provider is offline and cheap) so
+    # each stage can see which model the *next* usable stage will want. A stage
+    # whose successor runs the same local model leaves it loaded instead of
+    # unloading it only to pay a ~6.5 min cold load again.
+    reviewers = []
     for label, spec in specs:
         try:
-            provider = make_provider(spec)
+            reviewers.append((label, make_provider(spec)))
         except Exception as e:
             print(f"[{label}] unusable ({e}). Skipping this reviewer.")
-            continue
+
+    reviewed = 0
+    for position, (label, provider) in enumerate(reviewers):
+        next_label, next_provider = (reviewers[position + 1]
+                                     if position + 1 < len(reviewers)
+                                     else (None, None))
+        keep_after = _same_local_model(provider, next_provider)
+        if keep_after:
+            _stamp(f"LOAD    {label} and {next_label} are both "
+                   f"'{provider.model}' -- keeping it loaded between them "
+                   f"(no unload wait, no reload)")
         try:
-            verdicts = classify(events, provider, today, week_end, label)
+            verdicts = classify(events, provider, today, week_end, label,
+                                keep_after=keep_after)
         except Exception as e:
             print(f"[{label}] failed ({e}). Continuing without it.")
             continue

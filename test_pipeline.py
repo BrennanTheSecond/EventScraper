@@ -172,6 +172,70 @@ def test_thinking_fallback():
         vt._NO_THINKING_MODELS.update(remembered)
 
 
+def test_model_residency():
+    section("model residency -- never unload a model the next step reloads")
+    ollama_a = vt.OllamaProvider({"provider": "ollama", "model": "a:1b",
+                                  "url": "http://localhost:11434"})
+    ollama_a2 = vt.OllamaProvider({"provider": "ollama", "model": "a:1b",
+                                   "url": "http://localhost:11434"})
+    ollama_b = vt.OllamaProvider({"provider": "ollama", "model": "b:1b",
+                                  "url": "http://localhost:11434"})
+    remote_a = vt.OllamaProvider({"provider": "ollama", "model": "a:1b",
+                                  "url": "http://box:11434"})
+    check("the same model on the same server is one residency",
+          vt._same_local_model(ollama_a, ollama_a2))
+    check("a different model is not", not vt._same_local_model(ollama_a, ollama_b))
+    check("the same name on a different server is not",
+          not vt._same_local_model(ollama_a, remote_a))
+    check("there is no next stage to keep it for",
+          not vt._same_local_model(ollama_a, None))
+    check("a cloud stage holds no local RAM",
+          not vt._same_local_model(
+              ollama_a, vt.OpenAIProvider({"provider": "openai", "model": "a:1b"})))
+
+    slept = []
+    real_sleep, vt.time.sleep = vt.time.sleep, lambda s: slept.append(s)
+    try:
+        vt._last_ollama_model = "a:1b"
+        vt.wait_for_model_unload("a:1b")
+        check("re-using the loaded model waits for nothing", slept == [])
+    finally:
+        vt.time.sleep = real_sleep
+        vt._last_ollama_model = None
+
+    calls = []
+
+    class FakeOllama:
+        def generate(self, **kwargs):
+            calls.append(kwargs.get("keep_alive"))
+            return {"response": '{"results": []}', "prompt_eval_count": 1,
+                    "eval_count": 1}
+
+        def ps(self):
+            return {"models": []}
+
+    real_ollama, vt.ollama = vt.ollama, FakeOllama()
+    real_batch, vt.CLASSIFY_BATCH_SIZE = vt.CLASSIFY_BATCH_SIZE, 1
+    events = [vt.Event(title="one"), vt.Event(title="two")]
+    today, week_end = date(2026, 8, 24), date(2026, 8, 30)
+    try:
+        vt._last_ollama_model = None
+        vt.classify(events, ollama_a, today, week_end, "worker")
+        check("batches before the last keep the model in RAM",
+              calls[0] == vt.KEEP_LOADED_SECONDS,
+              "a cold reload per batch would cost ~6.5 min each")
+        check("the last batch of the last stage unloads it", calls[-1] == 0)
+
+        calls.clear()
+        vt.classify(events, ollama_a, today, week_end, "worker", keep_after=True)
+        check("the last batch stays loaded when the next stage is the same model",
+              calls == [vt.KEEP_LOADED_SECONDS, vt.KEEP_LOADED_SECONDS])
+    finally:
+        vt.ollama = real_ollama
+        vt.CLASSIFY_BATCH_SIZE = real_batch
+        vt._last_ollama_model = None
+
+
 def test_week_filtering():
     section("_in_week -- multi-date text is a span")
     start, end = date(2026, 8, 24), date(2026, 8, 30)
@@ -245,6 +309,7 @@ def test_criteria_normalization():
 if __name__ == "__main__":
     for test in (test_parse_classification, test_dedupe, test_auto_matches,
                  test_permanent_errors, test_thinking_fallback,
+                 test_model_residency,
                  test_week_filtering, test_grouping,
                  test_escaping, test_scrape_roundtrip, test_email_bodies,
                  test_criteria_normalization):
