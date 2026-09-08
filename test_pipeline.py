@@ -306,13 +306,119 @@ def test_criteria_normalization():
           out[1] == {"n": 2, "text": "rich", "auto_match_flags": ["F"]})
 
 
+# Trimmed to the shape that matters: two semester tables the parser must read,
+# and the Career Services office-hours table it must not. The real page adds
+# prose and chrome around these, none of which the parser looks at.
+_FAIR_HTML = """
+<h2>Fall 2026</h2>
+<table>
+  <tr><th>Name</th><th>Date</th></tr>
+  <tr><td><a href="https://joinhandshake.com/f/1">Meet the Firms</a></td>
+      <td>September 8</td></tr>
+  <tr><td><a href="/students/bh.html">Business Horizons Career Fair</a></td>
+      <td>September 9-10</td></tr>
+  <tr><td>Engineering Expo</td><td>September 15-17</td></tr>
+</table>
+<h2>Spring 2027</h2>
+<table>
+  <tr><th>Name</th><th>Date</th></tr>
+  <tr><td>CLAHS Career Fair</td><td>February 17</td></tr>
+</table>
+<h2>Career Service Hours</h2>
+<table>
+  <tr><th>Day of the week</th><th>Summer AM Hours</th><th>Summer PM Hours</th></tr>
+  <tr><td>M Monday</td><td>8:00 am - 12:00 pm</td><td>1:00 pm - 5:00 pm</td></tr>
+</table>
+"""
+
+
+def test_career_fair_dates():
+    section("_parse_fair_dates -- the date cell carries no year, and may be a range")
+    check("a single day",
+          vt._parse_fair_dates("September 8", 2026) == [date(2026, 9, 8)])
+    check("a same-month range keeps its end day",
+          vt._parse_fair_dates("September 9-10", 2026)
+          == [date(2026, 9, 9), date(2026, 9, 10)],
+          "_DATE_RE alone sees only the 9, so the 10th would be lost")
+    check("an en dash is a range too",
+          vt._parse_fair_dates("October 5\u20136", 2026)
+          == [date(2026, 10, 5), date(2026, 10, 6)])
+    check("the year comes from the caller, not the cell",
+          vt._parse_fair_dates("February 17", 2027) == [date(2027, 2, 17)])
+    check("a cross-month range already parses as two dates",
+          vt._parse_fair_dates("September 30 - October 2", 2026)
+          == [date(2026, 9, 30), date(2026, 10, 2)])
+    check("an impossible day is dropped rather than raising",
+          vt._parse_fair_dates("February 30-31", 2026) == [])
+    check("a cell with no date at all", vt._parse_fair_dates("TBD", 2026) == [])
+
+
+def test_career_fair_parsing():
+    section("fetch_career_fairs -- semester tables, not a uConnect feed")
+    source = {"id": "career_fairs", "name": "VT Career Fairs",
+              "url": "https://career.vt.edu/resources/career-fairs/"}
+    real_get, vt._get = vt._get, lambda url, as_json=False: _FAIR_HTML
+    try:
+        fall = vt.fetch_career_fairs(source, date(2026, 9, 7), date(2026, 9, 13))
+        spanning = vt.fetch_career_fairs(source, date(2026, 9, 16), date(2026, 9, 20))
+        spring = vt.fetch_career_fairs(source, date(2027, 2, 15), date(2027, 2, 21))
+        hours = vt.fetch_career_fairs(source, date(2026, 6, 1), date(2026, 6, 7))
+    finally:
+        vt._get = real_get
+
+    titles = [e.title for e in fall]
+    check("fairs inside the week are collected",
+          titles == ["Meet the Firms", "Business Horizons Career Fair"],
+          f"got {titles}")
+    check("a fair whose span reaches into the week is not missed",
+          [e.title for e in spanning] == ["Engineering Expo"],
+          "September 15-17 starts before a week beginning the 16th")
+    check("the year is read from the section heading, not the run's year",
+          [e.dates for e in spring] == [[date(2027, 2, 17)]],
+          "a Spring 2027 row must not be dated 2026")
+    check("the office-hours table is not parsed as events", hours == [],
+          "its header is not Name | Date")
+    check("a relative href is resolved against the page",
+          fall[1].link == "https://career.vt.edu/students/bh.html")
+    check("an absolute href is left alone",
+          fall[0].link == "https://joinhandshake.com/f/1")
+    check("the source id is carried through",
+          all(e.source_id == "career_fairs" for e in fall))
+
+
+def test_config_json_errors():
+    section("_read_json -- a hand-edited config typo is an expected failure")
+    import tempfile, os
+    bad = os.path.join(tempfile.mkdtemp(), "sources.json")
+    with open(bad, "w", encoding="utf-8") as fh:
+        fh.write('{\n  "sources": [\n    {\n      "url": "http://a"\n'
+                 '      "type": "news"\n    }\n  ]\n}\n')
+    try:
+        vt._read_json(bad, "The sources file")
+        check("a malformed file exits", False, "it returned instead")
+    except SystemExit as e:
+        msg = str(e)
+        check("a malformed file exits rather than raising JSONDecodeError", True)
+        check("the message names the file", bad in msg, msg)
+        check("the message names the line", "line 5" in msg, msg)
+
+    try:
+        vt._require_key({"srcs": []}, "sources", bad, "The sources file")
+        check("a missing top-level key exits", False, "it returned instead")
+    except SystemExit as e:
+        check("a missing top-level key exits", True)
+        check("the message names the key", '"sources" key' in str(e), str(e))
+
+
 if __name__ == "__main__":
     for test in (test_parse_classification, test_dedupe, test_auto_matches,
                  test_permanent_errors, test_thinking_fallback,
                  test_model_residency,
                  test_week_filtering, test_grouping,
                  test_escaping, test_scrape_roundtrip, test_email_bodies,
-                 test_criteria_normalization):
+                 test_criteria_normalization,
+                 test_career_fair_dates, test_career_fair_parsing,
+                 test_config_json_errors):
         test()
 
     print()

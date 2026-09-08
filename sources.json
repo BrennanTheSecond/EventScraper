@@ -13,6 +13,12 @@
       "type": "career_vt"
     },
     {
+      "id": "career_fairs",
+      "name": "Virginia Tech Career Fairs",
+      "url": "https://career.vt.edu/resources/career-fairs/",
+      "type": "career_fairs"
+    },
+    {
       "id": "gobblerconnect",
       "name": "GobblerConnect",
       "url": "https://gobblerconnect.vt.edu/events",

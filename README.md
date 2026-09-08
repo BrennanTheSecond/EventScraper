@@ -308,8 +308,16 @@ fetches (or that a web-search worker is told to browse):
 ```
 
 In `builtin` mode each entry's `type` maps to a parser:
-`events_vt`, `career_vt`, `gobblerconnect`, or `news`. Unknown types are
-skipped. In `web_search` mode only the `name` and `url` are used (the model
+`events_vt`, `career_vt`, `career_fairs`, `gobblerconnect`, or `news`. Unknown
+types are skipped.
+
+The `type` must match the page, not just the domain. `career_vt` parses the
+uConnect events archive at `career.vt.edu/events/` (`li.event_item`), while
+`career_fairs` parses the semester schedule tables at
+`career.vt.edu/resources/career-fairs/` — the same site, but markup with no
+`li.event_item` in it. Giving a page the wrong parser is a silent failure: the
+source collects nothing and prints only `WARNING: <id> returned no events this
+week`. In `web_search` mode only the `name` and `url` are used (the model
 browses them itself).
 
 ---
