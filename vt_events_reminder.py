@@ -10,6 +10,7 @@ from email.message import EmailMessage
 import json
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
+from urllib.parse import urljoin
 
 try:
     from dotenv import load_dotenv
@@ -57,6 +58,32 @@ def _json_path(base_name, config_dir):
     return os.path.join(config_dir, base_name)
 
 
+def _read_json(path, what):
+    """Parse a JSON file, or exit naming the file and the offending line.
+
+    load_config() already exits cleanly when a config file is *missing*, but a
+    malformed one used to raise JSONDecodeError straight out of module import:
+    a single missing comma in sources.json ended the run in a twenty-line
+    traceback whose last line was the only useful part. These files are
+    hand-edited, so a typo is the expected failure, not an exceptional one.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except json.JSONDecodeError as e:
+        sys.exit(f"{what} is not valid JSON: {path}\n"
+                 f"  line {e.lineno}, column {e.colno}: {e.msg}")
+    except OSError as e:
+        sys.exit(f"Could not read {what}: {path}\n  {e}")
+
+
+def _require_key(doc, key, path, what):
+    """Pull a required top-level key, or exit saying which file lacks it."""
+    if not isinstance(doc, dict) or key not in doc:
+        sys.exit(f"{what} must be a JSON object with a \"{key}\" key: {path}")
+    return doc[key]
+
+
 def _normalize_criteria(raw):
     """Number the interest criteria and accept both shorthand and full form.
 
@@ -97,8 +124,7 @@ def load_config():
                  f"Copy config.example.json to config.json and edit it, or point "
                  f"CONFIG_PATH / --config at another file.")
 
-    with open(cfg_path, "r", encoding="utf-8") as fh:
-        cfg = json.load(fh)
+    cfg = _read_json(cfg_path, "The config file")
 
     # Secrets from .env next to the config (or wherever DOTENV_PATH points).
     env_path = os.environ.get("DOTENV_PATH",
@@ -114,10 +140,12 @@ def load_config():
     interests_path = _json_path(files.get("interests", "interests.json"), config_dir)
     sources_path = _json_path(files.get("sources", "sources.json"), config_dir)
 
-    with open(interests_path, "r", encoding="utf-8") as fh:
-        cfg["_interests"] = _normalize_criteria(json.load(fh)["criteria"])
-    with open(sources_path, "r", encoding="utf-8") as fh:
-        cfg["_sources"] = json.load(fh)["sources"]
+    interests_doc = _read_json(interests_path, "The interests file")
+    cfg["_interests"] = _normalize_criteria(
+        _require_key(interests_doc, "criteria", interests_path, "The interests file"))
+    sources_doc = _read_json(sources_path, "The sources file")
+    cfg["_sources"] = _require_key(sources_doc, "sources", sources_path,
+                                   "The sources file")
 
     return cfg
 
@@ -611,6 +639,105 @@ def fetch_career_vt(source, week_start, week_end):
     return events
 
 
+# The career-fair page dates each fair by its section heading ("Fall 2026"),
+# never inside the cell, and writes two-day fairs as "September 9-10" -- a form
+# _DATE_RE cannot see the end of, because there is no month token before the
+# "10".
+_FAIR_SEMESTER_RE = re.compile(r"\b(?:Fall|Spring|Summer|Winter)\s+(\d{4})\b", re.I)
+_FAIR_RANGE_RE = re.compile(
+    r"\b(" + _MONTH_RE + r")\.?\s+(\d{1,2})\s*[-\u2013\u2014]\s*(\d{1,2})\b", re.I)
+
+
+def _parse_fair_dates(text, year):
+    """Dates in a career-fair date cell, with same-month ranges expanded.
+
+    "September 8" needs nothing special. "September 9-10" would otherwise parse
+    as a single day, which files a two-day fair under its first day only and
+    hides it entirely from a week containing just its second.
+    """
+    dates = _parse_dates(text, year)
+    m = _FAIR_RANGE_RE.search(text or "")
+    if not m:
+        return dates
+    try:
+        month = datetime.strptime(m.group(1)[:3].title(), "%b").month
+        end = date(year, month, int(m.group(3)))
+    except ValueError:
+        return dates
+    if end not in dates:
+        dates.append(end)
+    return dates
+
+
+def fetch_career_fairs(source, week_start, week_end):
+    """career.vt.edu career-fair tables -- a semester schedule, not a feed.
+
+    This page is not a uConnect archive: it carries no li.event_item at all, so
+    pointing fetch_career_vt() at it collects nothing and warns every run. What
+    it does carry is one "Name | Date" table per semester, each row linking to
+    that fair's own page (Handshake, Pamplin, the CS department, ...).
+
+    Two things about the markup drive the parsing. The year lives in the
+    heading above the table, not in any cell, so it is read from there -- and
+    "Spring 2027" really is calendar 2027, so the heading year needs no offset.
+    A third table on the same page lists Career Services office hours, which is
+    why the header row is checked instead of every table being parsed.
+    """
+    url = source["url"]
+    try:
+        soup = BeautifulSoup(_get(url), "html.parser")
+    except Exception as e:
+        print(f"  [error] {url}: {e}")
+        return []
+
+    events, seen = [], set()
+    for table in soup.select("table"):
+        rows = table.select("tr")
+        if not rows:
+            continue
+        header = [_clean(c.get_text(" ", strip=True)).lower()
+                  for c in rows[0].select("th, td")]
+        if header[:2] != ["name", "date"]:
+            continue  # office hours, or a layout this parser does not know.
+
+        heading = table.find_previous(["h1", "h2", "h3", "h4"])
+        semester = _clean(heading.get_text(" ", strip=True)) if heading else ""
+        m = _FAIR_SEMESTER_RE.search(semester)
+        year = int(m.group(1)) if m else week_start.year
+
+        for tr in rows[1:]:
+            cells = tr.select("th, td")
+            if len(cells) < 2:
+                continue
+            title = _clean(cells[0].get_text(" ", strip=True))
+            when = _clean(cells[1].get_text(" ", strip=True))
+            if not title or not when:
+                continue
+            dates = _parse_fair_dates(when, year)
+            if not _in_week(dates, week_start, week_end):
+                continue
+
+            anchor = tr.select_one("a[href]")
+            link = urljoin(url, anchor["href"]) if anchor else url
+            if (title.lower(), link) in seen:
+                continue
+            seen.add((title.lower(), link))
+
+            events.append(Event(
+                title=title[:200],
+                when=when,
+                dates=dates,
+                description=(f"Virginia Tech career fair"
+                             f"{f' ({semester})' if semester else ''}: "
+                             f"{title}, {when}."),
+                category="Career fair",
+                link=link,
+                source_id=source["id"],
+                source_url=url,
+            ))
+    return events
+
+
 def fetch_gobblerconnect(source, week_start, week_end):
     """GobblerConnect -- CampusGroups JSON web service (no browser needed).
 
@@ -709,6 +836,7 @@ def fetch_news_vt(source, week_start, week_end):
 _COLLECTORS = {
     "events_vt": fetch_events_vt,
     "career_vt": fetch_career_vt,
+    "career_fairs": fetch_career_fairs,
     "gobblerconnect": fetch_gobblerconnect,
     "news": fetch_news_vt,
 }
@@ -1113,13 +1241,17 @@ def _parse_classification(raw, batch_size, start_index):
     return parsed
 
 
-def classify(events, provider, today, week_end, label):
+def classify(events, provider, today, week_end, label, keep_after=False):
     """Classify every event with one model, a batch at a time.
 
     Returns {index: (matches, reason)}. A batch whose reply never parses is
     skipped rather than aborting the run -- the cost of a bad batch is 25
     events falling back to whatever the other reviewers said, not the loss of
     the whole night's work.
+
+    `keep_after` says the next reviewer will run this very same local model, so
+    even the last batch should leave it in RAM. Unloading it there would buy
+    nothing and cost the next stage a full cold load.
     """
     results = {}
     total = (len(events) + CLASSIFY_BATCH_SIZE - 1) // CLASSIFY_BATCH_SIZE
@@ -1131,8 +1263,10 @@ def classify(events, provider, today, week_end, label):
             raw = call_model(provider, prompt, want_json=True,
                              thinking=_thinking_for(provider), label=tag,
                              # Hold the model in RAM until this reviewer's last
-                             # batch, then let it go so the next stage can load.
-                             keep_loaded=batch_no < total)
+                             # batch, then let it go so the next stage can load
+                             # -- unless the next stage is the same model, in
+                             # which case there is nothing to make room for.
+                             keep_loaded=batch_no < total or keep_after)
             parsed = _parse_classification(raw, len(batch), start)
         except Exception as e:
             print(f"[{tag}] failed ({e}). Skipping this batch.")
@@ -1158,6 +1292,18 @@ def _thinking_for(provider):
     return MODEL_THINKING.get(provider.model)
 
 
+def _same_local_model(a, b):
+    """True when two reviewers would put the exact same model in the same RAM.
+
+    Only Ollama has a model to evict, and only a *different* Ollama model needs
+    evicting: two stages pointing at one model on one server share the load, so
+    neither the unload wait nor the reload is real work.
+    """
+    if not (isinstance(a, OllamaProvider) and isinstance(b, OllamaProvider)):
+        return False
+    return (a.model, a.url) == (b.model, b.url)
+
+
 def run_classification(events, today, week_end):
     """Fill in `matches`/`reason` on every event.
 
@@ -1178,15 +1324,30 @@ def run_classification(events, today, week_end):
     if NUM_JUDGES >= 2:
         specs.append(("judge2", JUDGE2_SPEC))
 
-    reviewed = 0
+    # Build every reviewer up front (make_provider is offline and cheap) so
+    # each stage can see which model the *next* usable stage will want. A stage
+    # whose successor runs the same local model leaves it loaded instead of
+    # unloading it only to pay a ~6.5 min cold load again.
+    reviewers = []
     for label, spec in specs:
         try:
-            provider = make_provider(spec)
+            reviewers.append((label, make_provider(spec)))
         except Exception as e:
             print(f"[{label}] unusable ({e}). Skipping this reviewer.")
-            continue
+
+    reviewed = 0
+    for position, (label, provider) in enumerate(reviewers):
+        next_label, next_provider = (reviewers[position + 1]
+                                     if position + 1 < len(reviewers)
+                                     else (None, None))
+        keep_after = _same_local_model(provider, next_provider)
+        if keep_after:
+            _stamp(f"LOAD    {label} and {next_label} are both "
+                   f"'{provider.model}' -- keeping it loaded between them "
+                   f"(no unload wait, no reload)")
         try:
-            verdicts = classify(events, provider, today, week_end, label)
+            verdicts = classify(events, provider, today, week_end, label,
+                                keep_after=keep_after)
         except Exception as e:
             print(f"[{label}] failed ({e}). Continuing without it.")
             continue
