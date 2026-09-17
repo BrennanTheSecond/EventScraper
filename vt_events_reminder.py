@@ -1,4 +1,5 @@
 import html
+import importlib.util
 import os
 import re
 import sys
@@ -147,6 +148,10 @@ def load_config():
     cfg["_sources"] = _require_key(sources_doc, "sources", sources_path,
                                    "The sources file")
 
+    # Collector modules are resolved against this too, so a config that moves
+    # takes its per-site parsers with it.
+    cfg["_config_dir"] = config_dir
+
     return cfg
 
 
@@ -173,6 +178,7 @@ def apply_config(cfg):
     global OUTPUT_MODE, CLASSIFY_BATCH_SIZE, CLASSIFY_DETAIL_LIMIT
     global CALL_MAX_ATTEMPTS, CALL_BACKOFF_SECONDS, CLOUD_TIMEOUT, DEFAULT_MAX_TOKENS
     global GOBBLERCONNECT_PAGE_SIZE, GOBBLERCONNECT_MAX_EVENTS, EVENT_DETAIL_LIMIT
+    global CONFIG_DIR
 
     MODEL_SPECS = models
     WORKER_SPEC = models["worker"]
@@ -250,6 +256,8 @@ def apply_config(cfg):
     GOBBLERCONNECT_PAGE_SIZE = scrape.get("gobblerconnect_page_size", 100)
     GOBBLERCONNECT_MAX_EVENTS = scrape.get("gobblerconnect_max_events", 600)
     EVENT_DETAIL_LIMIT = scrape.get("event_detail_limit", 1800)
+
+    CONFIG_DIR = cfg.get("_config_dir") or os.path.dirname(DEFAULT_CONFIG_PATH)
 
 
 _CFG = load_config()
@@ -833,12 +841,235 @@ def fetch_news_vt(source, week_start, week_end):
     return events
 
 
+# ---------------------------------------------------------------------------
+# Sources that do not have a parser written into this file
+#
+# Onboarding a source otherwise means picking a type from _COLLECTORS below,
+# which works only when the new page's markup happens to match a parser we
+# already wrote. When it does not, the failure is silent -- career_fairs exists
+# because the career-fair page was pointed at career_vt, whose li.event_item is
+# not in that page at all.
+#
+# Two escape hatches, neither of which puts a model between the site and the
+# event list:
+#
+#   type "auto"   -- the page's repeating item is described by a selector map in
+#                    sources.json. Data, not code: reviewable at a glance,
+#                    hand-editable when it drifts, and nothing to execute.
+#   type "module" -- the page needs real logic, so it gets ordinary Python in
+#                    its own file. fetch_career_fairs()'s heading-year lookup
+#                    and same-month range expansion is what that is for.
+#
+# Prefer "auto". Reach for "module" when a selector map cannot express the page.
+# ---------------------------------------------------------------------------
+
+_MODULE_CACHE = {}
+
+
+class _ScriptNamespace:
+    """This script's globals, handed to an injected collector module as `vt`.
+
+    Read through globals() rather than sys.modules[__name__] so it works however
+    this file was loaded: as __main__ under cron, or by path from
+    test_pipeline.py, which never registers itself in sys.modules. Resolving at
+    access time also means a collector sees the same _get() a test has replaced.
+    """
+
+    def __getattr__(self, name):
+        try:
+            return globals()[name]
+        except KeyError:
+            raise AttributeError(f"this script has no {name!r} for a collector "
+                                 f"to use") from None
+
+
+_SCRIPT = _ScriptNamespace()
+
+
+def _load_collector_module(path):
+    """Import a per-site parser module by path, once per run.
+
+    The module is handed this script as `vt` before its body runs, so a
+    collector says `vt.Event`, `vt._parse_dates`, `vt._in_week` rather than
+    reimplementing date handling -- a per-site module inventing its own
+    _DATE_RE is the maintenance trap this is meant to avoid.
+    """
+    resolved = _json_path(path, CONFIG_DIR)
+    if resolved in _MODULE_CACHE:
+        return _MODULE_CACHE[resolved]
+    if not os.path.exists(resolved):
+        raise FileNotFoundError(f"collector module not found: {resolved}")
+
+    spec = importlib.util.spec_from_file_location(
+        "vt_collector_" + re.sub(r"\W", "_", os.path.basename(resolved)), resolved)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load collector module: {resolved}")
+    module = importlib.util.module_from_spec(spec)
+    module.vt = _SCRIPT
+    spec.loader.exec_module(module)
+
+    if not callable(getattr(module, "fetch", None)):
+        raise AttributeError(f"{resolved} defines no callable fetch(source, "
+                             f"week_start, week_end)")
+    _MODULE_CACHE[resolved] = module
+    return module
+
+
+def _validated(source, found):
+    """Keep a per-site module's mistakes out of the report.
+
+    Everything downstream -- group_by_day, the email, dedupe_events -- assumes
+    an Event with a title. A module is ordinary Python someone wrote for one
+    page, so check that rather than discovering it in the renderer.
+    """
+    sid = source.get("id", "?")
+    if not isinstance(found, list):
+        print(f"  [error] {sid}: fetch() returned {type(found).__name__}, "
+              f"not a list")
+        return []
+    good = []
+    for item in found:
+        if not isinstance(item, Event):
+            print(f"  WARNING: {sid}: dropping a {type(item).__name__} that is "
+                  f"not an Event")
+            continue
+        if not item.title:
+            print(f"  WARNING: {sid}: dropping an event with no title")
+            continue
+        # A module that forgets these would break the report's per-source
+        # grouping and its "full list" links, so fill them in rather than fail.
+        item.source_id = item.source_id or sid
+        item.source_url = item.source_url or source.get("url", "")
+        good.append(item)
+    return good
+
+
+def fetch_module(source, week_start, week_end):
+    """A source whose parser lives in its own file (`type: "module"`)."""
+    path = source.get("module")
+    if not path:
+        print(f"  [error] {source.get('id', '?')}: type \"module\" needs a "
+              f"\"module\" path in sources.json")
+        return []
+    try:
+        module = _load_collector_module(path)
+        found = module.fetch(source, week_start, week_end)
+    except Exception as e:
+        # One bad module is one missing source, not a lost night's run -- the
+        # same blast radius a bad classification reply gets.
+        print(f"  [error] {source.get('id', '?')} ({path}): "
+              f"{type(e).__name__}: {e}")
+        return []
+    return _validated(source, found)
+
+
+def _auto_text(node, selector):
+    """Text of the first descendant matching `selector` ("" if unset or absent)."""
+    if not selector:
+        return ""
+    found = node.select_one(selector)
+    return _clean(found.get_text(" ", strip=True)) if found else ""
+
+
+def fetch_auto(source, week_start, week_end):
+    """A page described by a selector map rather than by its own parser.
+
+    `selectors.item` names the repeating element and the rest name nodes inside
+    it. Nothing is inferred at run time: the map is data in sources.json,
+    reviewed like any other config, so this collector is as deterministic as the
+    hand-written ones. `verified.items` records what the map matched when it was
+    captured, which is what lets a break report a number instead of a silence.
+    """
+    url = source["url"]
+    sid = source.get("id", "?")
+    sel = source.get("selectors") or {}
+    item_sel = sel.get("item")
+    if not item_sel:
+        print(f"  [error] {sid}: type \"auto\" needs selectors.item in "
+              f"sources.json")
+        return []
+    try:
+        soup = BeautifulSoup(_get(url), "html.parser")
+    except Exception as e:
+        print(f"  [error] {url}: {e}")
+        return []
+
+    items = soup.select(item_sel)
+    baseline = (source.get("verified") or {}).get("items")
+    if not items:
+        was = f", which matched {baseline} when captured" if baseline else ""
+        print(f"  WARNING: {sid}: selectors.item \"{item_sel}\" matched nothing"
+              f"{was} -- the listing markup has changed")
+        return []
+    if baseline and len(items) * 2 < baseline:
+        print(f"  WARNING: {sid}: selectors.item \"{item_sel}\" matched "
+              f"{len(items)}, down from {baseline} when captured")
+
+    flag_classes = source.get("flag_classes") or {}
+    events, seen, dated = [], set(), 0
+    for node in items:
+        text = _clean(node.get_text(" ", strip=True))
+        when = _auto_text(node, sel.get("date"))
+        dates = _parse_dates(when or text, week_start.year)
+        if dates:
+            dated += 1
+            if not _in_week(dates, week_start, week_end):
+                continue
+        elif not INCLUDE_UNDATED:
+            continue
+
+        anchor = node.select_one(sel.get("link") or "a[href]")
+        href = anchor.get("href") if anchor else ""
+        link = urljoin(url, href) if href else url
+
+        title = _auto_text(node, sel.get("title"))
+        if not title and anchor:
+            title = _clean(anchor.get_text(" ", strip=True))
+        if not title or title == text:
+            # The career_vt bug, generalised: a whole listing item as the
+            # title. Skipping the item and saying which selector produced
+            # nothing usable beats putting a paragraph in the digest.
+            print(f"  WARNING: {sid}: no usable title for an item "
+                  f"(selectors.title = {sel.get('title')!r})")
+            continue
+
+        key = (link, _normalize_text(title))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        events.append(Event(
+            title=title[:200],
+            when=when,
+            dates=dates,
+            location=_auto_text(node, sel.get("location")),
+            description=(_auto_text(node, sel.get("description")) or text)[:700],
+            category=_auto_text(node, sel.get("category")),
+            host=_auto_text(node, sel.get("host")),
+            link=link,
+            source_id=sid,
+            source_url=url,
+            # Only classes the map names outright, exactly as events.vt.edu's
+            # facets are read -- a flag is a published fact, never an inference.
+            flags=[label for cls, label in flag_classes.items()
+                   if cls in (node.get("class") or [])]
+                  + ([] if dates else ["undated"]),
+        ))
+
+    if sel.get("date") and not dated:
+        print(f"  WARNING: {sid}: selectors.date \"{sel['date']}\" parsed no "
+              f"date on any of {len(items)} items")
+    return events
+
+
 _COLLECTORS = {
     "events_vt": fetch_events_vt,
     "career_vt": fetch_career_vt,
     "career_fairs": fetch_career_fairs,
     "gobblerconnect": fetch_gobblerconnect,
     "news": fetch_news_vt,
+    "auto": fetch_auto,
+    "module": fetch_module,
 }
 
 

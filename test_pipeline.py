@@ -386,6 +386,247 @@ def test_career_fair_parsing():
           all(e.source_id == "career_fairs" for e in fall))
 
 
+_CAREER_RSS = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel>
+  <item>
+    <title>Resume Lab Drop-In</title>
+    <link>https://career.vt.edu/events/2026/09/17/resume-lab-drop-in/</link>
+    <pubDate>Wed, 16 Sep 2026 18:01:41 +0000</pubDate>
+    <description><![CDATA[<p>Bring a draft &amp; a question.</p>]]></description>
+  </item>
+  <item>
+    <title>Campus internEXP Information Session</title>
+    <link>https://career.vt.edu/events/2026/11/03/campus-internexp-session/</link>
+    <pubDate>Wed, 16 Sep 2026 18:01:40 +0000</pubDate>
+    <description>Interested in an internship on campus?</description>
+  </item>
+  <item>
+    <title>A page with no date in its permalink</title>
+    <link>https://career.vt.edu/students/handshake/</link>
+    <pubDate>Wed, 16 Sep 2026 18:01:39 +0000</pubDate>
+    <description>not an event permalink</description>
+  </item>
+  <item>
+    <title>Resume Lab Drop-In</title>
+    <link>https://career.vt.edu/events/2026/09/17/resume-lab-drop-in/</link>
+    <pubDate>Wed, 16 Sep 2026 18:00:00 +0000</pubDate>
+    <description>the same event listed twice</description>
+  </item>
+</channel></rss>
+"""
+
+# A page nobody has written a parser for, described by a selector map instead.
+_AUTO_HTML = """
+<ul class="listing">
+  <li class="card free-food">
+    <h3 class="t">Pizza and Pathways</h3>
+    <time class="d">September 17, 2026</time>
+    <span class="where">Squires 236</span>
+    <span class="cat">Workshop</span>
+    <a href="/events/pizza-and-pathways">details</a>
+  </li>
+  <li class="card">
+    <h3 class="t">Graduate Research Symposium</h3>
+    <time class="d">September 19, 2026</time>
+    <span class="where">Moss Arts Center</span>
+    <span class="cat">Research</span>
+    <a href="https://graduateschool.vt.edu/symposium.html">details</a>
+  </li>
+  <li class="card">
+    <h3 class="t">Winter Commencement</h3>
+    <time class="d">December 18, 2026</time>
+    <a href="/events/winter-commencement">details</a>
+  </li>
+  <li class="card">
+    <a href="/events/blob">September 18, 2026 an item whose only text is its own link</a>
+  </li>
+</ul>
+"""
+
+_AUTO_SELECTORS = {"item": "li.card", "title": "h3.t", "date": "time.d",
+                   "link": "a[href]", "location": ".where", "category": ".cat"}
+
+
+def _auto_source(**over):
+    source = {"id": "grad_school", "name": "Graduate School Events",
+              "url": "https://graduateschool.vt.edu/events.html",
+              "type": "auto", "selectors": dict(_AUTO_SELECTORS),
+              "flag_classes": {"free-food": "FREE FOOD"},
+              "verified": {"items": 4}}
+    source.update(over)
+    return source
+
+
+def _run_collector(fn, source, html, ws=date(2026, 9, 14), we=date(2026, 9, 20)):
+    """Call a collector with the network replaced, capturing what it printed."""
+    import io, contextlib
+    real_get = vt._get
+    vt._get = lambda url, as_json=False: html
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            found = fn(source, ws, we)
+    finally:
+        vt._get = real_get
+    return found, buf.getvalue()
+
+
+def test_module_collector():
+    section('type: "module" -- a per-site parser in its own file')
+    source = {"id": "career_rss", "name": "VT Career Center (RSS)",
+              "url": "https://career.vt.edu/events/feed/",
+              "type": "module", "module": "collectors/career_rss.py"}
+    found, out = _run_collector(vt.fetch_module, source, _CAREER_RSS)
+
+    titles = [e.title for e in found]
+    check("the module is loaded and its events collected",
+          titles == ["Resume Lab Drop-In"], f"got {titles} / {out}")
+    if not found:
+        return
+    event = found[0]
+    check("the date comes from the permalink, not pubDate",
+          event.dates == [date(2026, 9, 17)],
+          "every item in the live feed shares one pubDate")
+    check("an out-of-week item is dropped",
+          "Campus internEXP Information Session" not in titles)
+    check("an item whose permalink carries no date is dropped",
+          "A page with no date in its permalink" not in titles)
+    check("the same permalink twice yields one event", len(found) == 1)
+    check("the description is unescaped and de-tagged",
+          event.description == "Bring a draft & a question.", event.description)
+    check("the module reached back for vt.Event", isinstance(event, vt.Event))
+    check("the source id is carried through", event.source_id == "career_rss")
+
+
+def test_module_loader_failures():
+    section('type: "module" -- a bad module is one missing source, not a crash')
+    import os, tempfile
+    tmp = tempfile.mkdtemp()
+    real_dir, vt.CONFIG_DIR = vt.CONFIG_DIR, tmp
+
+    def write(name, body):
+        with open(os.path.join(tmp, name), "w", encoding="utf-8") as fh:
+            fh.write(body)
+        return {"id": name[:-3], "url": "http://x", "type": "module",
+                "module": name}
+
+    try:
+        found, out = _run_collector(
+            vt.fetch_module, {"id": "nopath", "url": "http://x",
+                              "type": "module"}, "")
+        check("a source with no module path is skipped with a message",
+              found == [] and "module" in out, out.strip())
+
+        found, out = _run_collector(
+            vt.fetch_module, {"id": "missing", "url": "http://x",
+                              "type": "module", "module": "not_here.py"}, "")
+        check("a missing file names the path it looked for",
+              found == [] and "not_here.py" in out, out.strip())
+
+        found, out = _run_collector(
+            vt.fetch_module, write("no_fetch.py", "X = 1\n"), "")
+        check("a module with no fetch() says so",
+              found == [] and "fetch" in out, out.strip())
+
+        found, out = _run_collector(vt.fetch_module, write(
+            "raises.py", "def fetch(source, ws, we):\n    raise ValueError('boom')\n"), "")
+        check("a module that raises is caught and named",
+              found == [] and "ValueError" in out and "boom" in out, out.strip())
+
+        found, out = _run_collector(vt.fetch_module, write(
+            "not_a_list.py", "def fetch(source, ws, we):\n    return {'a': 1}\n"), "")
+        check("a module returning a non-list is rejected",
+              found == [] and "not a list" in out, out.strip())
+
+        found, out = _run_collector(vt.fetch_module, write(
+            "junk.py",
+            "def fetch(source, ws, we):\n"
+            "    return ['a string', vt.Event(title=''), vt.Event(title='Real')]\n"), "")
+        check("non-Event and untitled entries are dropped, the good one kept",
+              [e.title for e in found] == ["Real"], f"{found} / {out}")
+        check("the drops are reported", out.count("WARNING") == 2, out.strip())
+        check("a module that forgot source_id has it filled in",
+              found and found[0].source_id == "junk", found[0].source_id if found else "")
+    finally:
+        vt.CONFIG_DIR = real_dir
+
+
+def test_auto_collector():
+    section('type: "auto" -- a selector map instead of a parser')
+    real_undated, vt.INCLUDE_UNDATED = vt.INCLUDE_UNDATED, True
+    try:
+        found, out = _run_collector(vt.fetch_auto, _auto_source(), _AUTO_HTML)
+    finally:
+        vt.INCLUDE_UNDATED = real_undated
+
+    titles = [e.title for e in found]
+    check("in-week items are collected from the map",
+          titles == ["Pizza and Pathways", "Graduate Research Symposium"],
+          f"got {titles} / {out}")
+    if len(found) < 2:
+        return
+    pizza, symposium = found
+    check("a class named in flag_classes becomes a flag",
+          pizza.flags == ["FREE FOOD"], str(pizza.flags))
+    check("a class not named in flag_classes is not inferred",
+          symposium.flags == [], str(symposium.flags))
+    check("the date selector feeds the week filter",
+          pizza.dates == [date(2026, 9, 17)], str(pizza.dates))
+    check("an out-of-week item is dropped",
+          "Winter Commencement" not in titles)
+    check("a relative href resolves against the page",
+          pizza.link == "https://graduateschool.vt.edu/events/pizza-and-pathways",
+          pizza.link)
+    check("an absolute href is left alone",
+          symposium.link == "https://graduateschool.vt.edu/symposium.html")
+    check("the location selector fills the location",
+          pizza.location == "Squires 236", pizza.location)
+    check("the category selector fills the category",
+          pizza.category == "Workshop", pizza.category)
+    check("an item with no title node of its own is skipped, not titled with "
+          "its whole text",
+          not any("only text is its own link" in t for t in titles),
+          "this is the career_vt text[:160] bug, generalised")
+    check("skipping it names the selector that found nothing",
+          "selectors.title" in out, out.strip())
+
+
+def test_auto_collector_drift():
+    section('type: "auto" -- the map records what it matched, so drift is loud')
+    found, out = _run_collector(
+        vt.fetch_auto, _auto_source(), "<ul><li class='other'>redesigned</li></ul>")
+    check("a map that matches nothing collects nothing", found == [])
+    check("the warning names the selector", "li.card" in out, out.strip())
+    check("the warning names the count it used to match",
+          "4 when captured" in out, out.strip())
+
+    found, out = _run_collector(
+        vt.fetch_auto, _auto_source(verified={"items": 40}), _AUTO_HTML)
+    check("a collapse in item count warns even when some still match",
+          "down from 40" in out, out.strip())
+    check("the events are still collected", len(found) == 2)
+
+    found, out = _run_collector(
+        vt.fetch_auto, _auto_source(verified={}),
+        "<ul><li class='card'><h3 class='t'>No date here</h3>"
+        "<time class='d'>soon</time><a href='/x'>x</a></li></ul>")
+    check("a date selector that parses no date at all warns",
+          "parsed no date" in out, out.strip())
+    check("a source with no selectors.item is skipped with a message",
+          _run_collector(vt.fetch_auto, _auto_source(selectors={}),
+                         _AUTO_HTML)[0] == [])
+
+
+def test_collector_registry():
+    section("_COLLECTORS -- the new types are registered")
+    for name in ("auto", "module"):
+        check(f'type "{name}" resolves to a collector',
+              callable(vt._COLLECTORS.get(name)))
+    check("the hand-written types are untouched",
+          all(callable(vt._COLLECTORS.get(n)) for n in
+              ("events_vt", "career_vt", "career_fairs", "gobblerconnect", "news")))
+
+
 def test_config_json_errors():
     section("_read_json -- a hand-edited config typo is an expected failure")
     import tempfile, os
@@ -418,6 +659,9 @@ if __name__ == "__main__":
                  test_escaping, test_scrape_roundtrip, test_email_bodies,
                  test_criteria_normalization,
                  test_career_fair_dates, test_career_fair_parsing,
+                 test_module_collector, test_module_loader_failures,
+                 test_auto_collector, test_auto_collector_drift,
+                 test_collector_registry,
                  test_config_json_errors):
         test()
 
