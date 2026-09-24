@@ -528,23 +528,48 @@ def _event_detail_text(url, limit=None):
     return _strip_boilerplate(_clean(main.get_text(" ", strip=True)))[:limit]
 
 
-def fetch_events_vt(source, week_start, week_end):
-    """events.vt.edu -- month listing pages plus per-event detail pages."""
-    events, seen = [], set()
-    months = []
-    for d in (week_start, week_end):
-        if (d.year, d.month) not in months:
-            months.append((d.year, d.month))
+# events.vt.edu publishes one listing page per YEAR. The per-month URL this
+# collector used to build (events/{year}/{month}.html) 404s on the live site, so
+# the source contributed nothing to any run -- and reported it in the same voice
+# as a genuinely quiet week. Detail pages *do* live under the month path
+# (/events/2026/09/<slug>.html), which is what made a month listing look
+# plausible. Measured 2026-09-16: the year page carries 99 items (43 in
+# September alone) against 7 on the site root, and the root's items are a strict
+# subset of the year page's, so there is nothing to gain by fetching both.
+EVENTS_VT_ITEM_SEL = "li.event-page"
 
-    for year, month in months:
-        url = f"https://events.vt.edu/events/{year}/{month:02d}.html"
+
+def _events_vt_listing_urls(week_start, week_end):
+    """One listing URL per year the week touches -- two only across New Year."""
+    years = []
+    for d in (week_start, week_end):
+        if d.year not in years:
+            years.append(d.year)
+    return [(y, f"https://events.vt.edu/events/{y}.html") for y in years]
+
+
+def fetch_events_vt(source, week_start, week_end):
+    """events.vt.edu -- year listing pages plus per-event detail pages."""
+    events, seen = [], set()
+
+    for year, url in _events_vt_listing_urls(week_start, week_end):
         try:
             soup = BeautifulSoup(_get(url), "html.parser")
         except Exception as e:
             print(f"  [error] {url}: {e}")
             continue
 
-        for li in soup.select("li.event-page"):
+        items = soup.select(EVENTS_VT_ITEM_SEL)
+        if not items:
+            # A page that fetches cleanly and then matches nothing is a
+            # redesign, not a quiet week. Downstream the two are identical --
+            # both end as an empty list -- so name the selector that stopped
+            # matching here, while we still know which one it was.
+            print(f"  WARNING: {url} returned 200 but no "
+                  f"{EVENTS_VT_ITEM_SEL} items -- the listing markup changed")
+            continue
+
+        for li in items:
             text = _clean(li.get_text(" ", strip=True))
             dates = _parse_dates(text, year)
             if not _in_week(dates, week_start, week_end):

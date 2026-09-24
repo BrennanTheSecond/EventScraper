@@ -386,6 +386,174 @@ def test_career_fair_parsing():
           all(e.source_id == "career_fairs" for e in fall))
 
 
+# Four real li.event-page items from https://events.vt.edu/events/2026.html,
+# captured 2026-09-16, with the image/srcset wrappers cut out. The class
+# attributes are verbatim: they are the authoritative facets the parser reads,
+# so trimming those would defeat the point of the fixture. The last <li> repeats
+# the Eric Lyon href to exercise the de-duplication guard.
+_EVENTS_VT_HTML = """
+<ul>
+<li class="col-12 col-md-6 item locations_-blacksburg-va-24061 categories_-concert departments_-school-of-performing-arts types_-in-person audiences_-public event-page">
+  <span class="vt-list-item-heading-text">Event Item</span>
+  <span class="vt-list-item-title">
+    <a href="https://events.vt.edu/events/2026/09/eric-lyon-portrait-2026.html">
+      Eric Lyon Portrait Concert, featuring Annie Stevens and Alan Weinstein
+      <span class="sr-only">, event</span>
+    </a>
+  </span>
+  <span class="vt-list-item-date">
+    <span class="vt-list-item-dateHeading">Date: </span>
+    <span class="vt-list-item-date-start">Sep 16, 2026</span>
+  </span>
+</li>
+<li class="col-12 col-md-6 item types_-hybrid categories_-meeting departments_-virginia-tech-carilion-school-of-medicine admission_-free audiences_-public event-page">
+  <span class="vt-list-item-heading-text">Event Item</span>
+  <span class="vt-list-item-title">
+    <a href="https://events.vt.edu/events/2026/09/staff-senate-monthly-meeting.html">
+      Staff Senate Monthly Meeting<span class="sr-only">, event</span>
+    </a>
+  </span>
+  <span class="vt-list-item-date">
+    <span class="vt-list-item-dateHeading">Date: </span>
+    <span class="vt-list-item-date-start">Sep 17, 2026</span>
+  </span>
+</li>
+<li class="col-12 col-md-6 item categories_-open-house locations_-blacksburg-va-24061 audiences_-faculty audiences_-public features_-free-food features_-free-parking features_-interactive-activities types_-in-person departments_-research-and-innovation event-page">
+  <span class="vt-list-item-heading-text">Event Item</span>
+  <span class="vt-list-item-title">
+    <a href="https://events.vt.edu/events/2026/09/ncfl-open-house-and-user-appreciation-day.html">
+      NCFL Open House and User Appreciation Day<span class="sr-only">, event</span>
+    </a>
+  </span>
+  <span class="vt-list-item-date">
+    <span class="vt-list-item-dateHeading">Date: </span>
+    <span class="vt-list-item-date-start">Sep 18, 2026</span>
+  </span>
+</li>
+<li class="col-12 col-md-6 item categories_-exhibition types_-in-person departments_-research-and-innovation event-page">
+  <span class="vt-list-item-heading-text">Event Item</span>
+  <span class="vt-list-item-title">
+    <a href="https://events.vt.edu/events/2026/10/flip-the-fair-2026.html">
+      Flip the Fair 2026<span class="sr-only">, event</span>
+    </a>
+  </span>
+  <span class="vt-list-item-date">
+    <span class="vt-list-item-dateHeading">Date: </span>
+    <span class="vt-list-item-date-start">Oct 01, 2026</span>
+  </span>
+</li>
+<li class="col-12 col-md-6 item categories_-concert event-page">
+  <span class="vt-list-item-heading-text">Event Item</span>
+  <span class="vt-list-item-title">
+    <a href="https://events.vt.edu/events/2026/09/eric-lyon-portrait-2026.html">
+      Eric Lyon Portrait Concert (repeat listing)<span class="sr-only">, event</span>
+    </a>
+  </span>
+  <span class="vt-list-item-date">
+    <span class="vt-list-item-dateHeading">Date: </span>
+    <span class="vt-list-item-date-start">Sep 16, 2026</span>
+  </span>
+</li>
+</ul>
+"""
+
+_DETAIL_HTML = "<main><p>A description from the detail page.</p></main>"
+
+
+def _events_vt_fake_get(listing):
+    """Serve the year listing for a listing URL, a stub for any detail page."""
+    def fake(url, as_json=False):
+        tail = url.rsplit("/", 1)[-1]          # "2026.html" or "<slug>.html"
+        return listing if tail[:-5].isdigit() else _DETAIL_HTML
+    return fake
+
+
+def test_events_vt_listing_urls():
+    section("_events_vt_listing_urls -- the listing is per year, not per month")
+    check("one URL for a week inside a single year",
+          vt._events_vt_listing_urls(date(2026, 9, 14), date(2026, 9, 20))
+          == [(2026, "https://events.vt.edu/events/2026.html")])
+    check("a week spanning New Year fetches both years",
+          vt._events_vt_listing_urls(date(2026, 12, 28), date(2027, 1, 3))
+          == [(2026, "https://events.vt.edu/events/2026.html"),
+              (2027, "https://events.vt.edu/events/2027.html")],
+          "the January half of the week would otherwise be invisible")
+
+
+def test_events_vt_parsing():
+    section("fetch_events_vt -- year listing, facets read from the CSS classes")
+    source = {"id": "events_vt", "name": "Virginia Tech Events",
+              "url": "https://events.vt.edu/"}
+    real_get, real_delay = vt._get, vt.POLITE_DELAY
+    vt._get, vt.POLITE_DELAY = _events_vt_fake_get(_EVENTS_VT_HTML), 0
+    try:
+        found = vt.fetch_events_vt(source, date(2026, 9, 14), date(2026, 9, 20))
+    finally:
+        vt._get, vt.POLITE_DELAY = real_get, real_delay
+
+    titles = [e.title for e in found]
+    check("only the in-week items are collected",
+          titles == ["Eric Lyon Portrait Concert, featuring Annie Stevens "
+                     "and Alan Weinstein",
+                     "Staff Senate Monthly Meeting",
+                     "NCFL Open House and User Appreciation Day"],
+          f"got {titles}")
+    check("a title containing a comma survives the ', event' split",
+          titles and titles[0].endswith("Annie Stevens and Alan Weinstein"),
+          "splitting on the first comma would truncate it at 'Concert'")
+    check("an out-of-week item is dropped", "Flip the Fair 2026" not in titles,
+          "October 1 is not in the week of September 14")
+    check("a repeated href is listed once",
+          sum(1 for t in titles if t.startswith("Eric Lyon")) == 1)
+
+    by_title = {e.title.split(",")[0]: e for e in found}
+    ncfl = by_title.get("NCFL Open House and User Appreciation Day")
+    check("free food is read from the listing class, not from a description",
+          ncfl and ncfl.flags == ["FREE FOOD", "free parking"],
+          f"got {ncfl.flags if ncfl else None}")
+    check("the location facet becomes the location",
+          ncfl and ncfl.location == "blacksburg va 24061",
+          ncfl.location if ncfl else "")
+    check("the category facet becomes the category",
+          ncfl and ncfl.category == "open house", ncfl.category if ncfl else "")
+    check("the department facet becomes the host",
+          ncfl and ncfl.host == "research and innovation",
+          ncfl.host if ncfl else "")
+    check("admission_-free is a flag too",
+          by_title["Staff Senate Monthly Meeting"].flags == ["free admission"])
+    check("an item with no feature classes carries no flags",
+          by_title["Eric Lyon Portrait Concert"].flags == [])
+    check("the date is parsed, so the report can group by day",
+          ncfl and ncfl.dates == [date(2026, 9, 18)],
+          str(ncfl.dates) if ncfl else "")
+    check("the event links to its own page, not to the listing",
+          ncfl and ncfl.link.endswith("/ncfl-open-house-and-user-appreciation-day.html"))
+    check("the detail page supplies the description",
+          ncfl and "description from the detail page" in ncfl.description,
+          ncfl.description[:60] if ncfl else "")
+
+
+def test_events_vt_selector_miss():
+    section("fetch_events_vt -- a 200 that matches nothing is not a quiet week")
+    import io, contextlib
+    source = {"id": "events_vt", "name": "Virginia Tech Events",
+              "url": "https://events.vt.edu/"}
+    real_get = vt._get
+    vt._get = lambda url, as_json=False: "<html><body><p>redesigned</p></body></html>"
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            found = vt.fetch_events_vt(source, date(2026, 9, 14), date(2026, 9, 20))
+    finally:
+        vt._get = real_get
+    out = buf.getvalue()
+    check("nothing is collected", found == [])
+    check("the miss is reported as a WARNING", "WARNING" in out, out)
+    check("the message names the selector that stopped matching",
+          vt.EVENTS_VT_ITEM_SEL in out, out)
+    check("the message names the URL", "events/2026.html" in out, out)
+
+
 def test_config_json_errors():
     section("_read_json -- a hand-edited config typo is an expected failure")
     import tempfile, os
@@ -418,6 +586,8 @@ if __name__ == "__main__":
                  test_escaping, test_scrape_roundtrip, test_email_bodies,
                  test_criteria_normalization,
                  test_career_fair_dates, test_career_fair_parsing,
+                 test_events_vt_listing_urls, test_events_vt_parsing,
+                 test_events_vt_selector_miss,
                  test_config_json_errors):
         test()
 
