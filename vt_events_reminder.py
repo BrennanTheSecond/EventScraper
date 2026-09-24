@@ -155,6 +155,23 @@ def load_config():
     return cfg
 
 
+CLASSIFY_METHODS = ("llm", "laya", "shadow")
+
+LAYA_FREE_DEFAULTS = {
+    "model": "english",
+    "threshold": 0.5,
+    # Free admission is deliberately excluded: nearly every campus event is
+    # free to attend, so counting it would put most of the week in the digest.
+    "question": ("Does this event offer attendees free food, snacks, drinks, "
+                 "swag, or giveaways? Free admission alone does not count."),
+}
+LAYA_INTERESTS_DEFAULTS = {
+    "model": "english",
+    "threshold": 0.5,
+    "question": "Does this event match this interest: {criterion}?",
+}
+
+
 def apply_config(cfg):
     """Expose the loaded config as module-level globals."""
     models = cfg["models"]
@@ -179,6 +196,7 @@ def apply_config(cfg):
     global CALL_MAX_ATTEMPTS, CALL_BACKOFF_SECONDS, CLOUD_TIMEOUT, DEFAULT_MAX_TOKENS
     global GOBBLERCONNECT_PAGE_SIZE, GOBBLERCONNECT_MAX_EVENTS, EVENT_DETAIL_LIMIT
     global CONFIG_DIR
+    global CLASSIFY_METHOD, LAYA_DEVICE, LAYA_BATCH_SIZE, LAYA_FREE, LAYA_INTERESTS
 
     MODEL_SPECS = models
     WORKER_SPEC = models["worker"]
@@ -258,6 +276,21 @@ def apply_config(cfg):
     EVENT_DETAIL_LIMIT = scrape.get("event_detail_limit", 1800)
 
     CONFIG_DIR = cfg.get("_config_dir") or os.path.dirname(DEFAULT_CONFIG_PATH)
+
+    # Which classifier decides high-interest. "llm" is the Ollama/cloud
+    # reviewer pipeline; "laya" replaces it with the two laya classifiers;
+    # "shadow" runs the LLM pipeline for real and laya alongside it, printing
+    # only where laya would have decided differently.
+    CLASSIFY_METHOD = str(cfg.get("classification", {}).get("method", "llm")).lower().strip()
+    if CLASSIFY_METHOD not in CLASSIFY_METHODS:
+        sys.exit(f'classification.method must be one of '
+                 f'{", ".join(repr(m) for m in CLASSIFY_METHODS)} '
+                 f'(got "{CLASSIFY_METHOD}").')
+    laya_cfg = cfg.get("laya", {})
+    LAYA_DEVICE = laya_cfg.get("device", "cpu")
+    LAYA_BATCH_SIZE = max(1, int(laya_cfg.get("batch_size", 16)))
+    LAYA_FREE = {**LAYA_FREE_DEFAULTS, **(laya_cfg.get("free") or {})}
+    LAYA_INTERESTS = {**LAYA_INTERESTS_DEFAULTS, **(laya_cfg.get("interests") or {})}
 
 
 _CFG = load_config()
@@ -1417,6 +1450,14 @@ def auto_matches(event):
     return matched
 
 
+def apply_source_flags(events):
+    """Reset every event to what its source flags alone settle."""
+    for event in events:
+        event.matches = auto_matches(event)
+        event.reason = ("flagged by the source: " + event.free_stuff
+                        if event.matches else "")
+
+
 def get_classify_prompt(batch, start_index, today, week_end):
     """Prompt for one batch. Output is a few tokens per event."""
     listing = "\n".join(render_event(e, start_index + i)
@@ -1544,10 +1585,7 @@ def run_classification(events, today, week_end):
     line in the email costs nothing -- without any of the merge machinery,
     because there is no longer a list for reviewers to disagree about.
     """
-    for event in events:
-        event.matches = auto_matches(event)
-        if event.matches:
-            event.reason = "flagged by the source: " + event.free_stuff
+    apply_source_flags(events)
 
     specs = [("worker", WORKER_SPEC)]
     if NUM_JUDGES >= 1:
@@ -1600,6 +1638,196 @@ def run_classification(events, today, week_end):
         print("WARNING: no reviewer succeeded. High-interest events are those "
               "the sources flagged themselves.")
     return reviewed
+
+
+# ---------------------------------------------------------------------------
+# Laya classification
+#
+# laya (github.com/NandhaKishorM/laya) is a non-generative classifier: an
+# encoder that answers yes/no questions about a text in one forward pass, with
+# a probability per question. Nothing is generated, so nothing needs parsing,
+# and 125 events take ~2 minutes on CPU rather than hours of decode.
+#
+# It runs as two separate classifiers so each can have its own checkpoint and
+# threshold:
+#   free      -- answers every criterion that carries `auto_match_flags` (the
+#                free food / giveaways criterion) with one fixed question.
+#   interests -- answers every other criterion, one question per criterion.
+# Source flags still auto-match first; laya only adds to them.
+# ---------------------------------------------------------------------------
+
+_LAYA_AGENTS = {}
+
+
+def _laya_agent(name):
+    """The laya checkpoint `name`, loaded once per run.
+
+    A built-in name ("english", "multilingual", "typed-decisions" or one of
+    laya's aliases) resolves through laya's Router, which knows where those
+    live. Anything else is taken as a Hugging Face repo or a local directory,
+    which is how a fine-tuned checkpoint is plugged in.
+    """
+    if name not in _LAYA_AGENTS:
+        # Imported here so the llm method never pays the torch import.
+        from laya import Agent, Router
+        from laya.router import normalise_name
+        try:
+            key = normalise_name(name)
+        except ValueError:
+            agent = Agent(name, device=LAYA_DEVICE)
+        else:
+            agent = Router(device=LAYA_DEVICE).load(key)
+        _LAYA_AGENTS[name] = agent
+    return _LAYA_AGENTS[name]
+
+
+class LayaClassifier:
+    """One laya classifier: a yes/no question per interest criterion."""
+
+    def __init__(self, label, model, threshold, questions):
+        self.label = label
+        self.model = model
+        self.threshold = float(threshold)
+        self.questions = questions  # {criterion number: question text}
+
+    def probabilities(self, events):
+        """{event index: {criterion number: P(yes)}} for every event."""
+        schema = {f"c{n}": {"type": "noul", "instructions": text}
+                  for n, text in self.questions.items()}
+        states = [render_event(e) for e in events]
+        _stamp(f"LAYA    {self.label}: {len(events)} events x "
+               f"{len(schema)} question(s) on '{self.model}'")
+        results = _laya_agent(self.model).predict_batch(
+            states, schema, batch_size=LAYA_BATCH_SIZE)
+        _stamp(f"DONE    {self.label}")
+        return {i: {n: float(r["answers"][f"c{n}"]["noul"]) for n in self.questions}
+                for i, r in enumerate(results)}
+
+
+def laya_classifiers():
+    """The free and interests classifiers for the current criteria."""
+    free = [c for c in INTEREST_CRITERIA if c["auto_match_flags"]]
+    rest = [c for c in INTEREST_CRITERIA if not c["auto_match_flags"]]
+    classifiers = []
+    if free:
+        classifiers.append(LayaClassifier(
+            "laya-free", LAYA_FREE["model"], LAYA_FREE["threshold"],
+            {c["n"]: LAYA_FREE["question"] for c in free}))
+    if rest:
+        classifiers.append(LayaClassifier(
+            "laya-interests", LAYA_INTERESTS["model"], LAYA_INTERESTS["threshold"],
+            {c["n"]: LAYA_INTERESTS["question"].format(criterion=c["text"])
+             for c in rest}))
+    return classifiers
+
+
+def laya_verdicts(events):
+    """{event index: {criterion number: (P(yes), threshold)}} across both classifiers."""
+    verdicts = {i: {} for i in range(len(events))}
+    for clf in laya_classifiers():
+        for i, probs in clf.probabilities(events).items():
+            for n, p in probs.items():
+                verdicts[i][n] = (p, clf.threshold)
+    return verdicts
+
+
+def _laya_matches(event, verdict):
+    """What the laya method decides for one event: source flags plus laya."""
+    matches = auto_matches(event)
+    matches += [n for n, (p, threshold) in sorted(verdict.items())
+                if p >= threshold and n not in matches]
+    return matches
+
+
+def _laya_reason(verdict, matches):
+    return "laya: " + ", ".join(f"#{n} p={verdict[n][0]:.2f}"
+                                for n in matches if n in verdict)
+
+
+def run_laya_classification(events):
+    """Fill in `matches`/`reason` on every event from source flags and laya."""
+    apply_source_flags(events)
+    verdicts = laya_verdicts(events)
+    added = 0
+    for i, event in enumerate(events):
+        matches = _laya_matches(event, verdicts[i])
+        new = [n for n in matches if n not in event.matches]
+        if new:
+            event.matches = matches
+            event.reason = event.reason or _laya_reason(verdicts[i], new)
+            added += 1
+    print(f"[laya] added {added} new high-interest match(es)")
+
+
+def laya_disagreements(events, verdicts):
+    """Events where laya's matches differ from the ones already decided.
+
+    Returns [(event, verdict, added, dropped)], `added` being criteria laya
+    would have matched that the current method did not, `dropped` the reverse.
+    """
+    found = []
+    for i, event in enumerate(events):
+        would = set(_laya_matches(event, verdicts[i]))
+        have = set(event.matches)
+        if would != have:
+            found.append((event, verdicts[i], sorted(would - have), sorted(have - would)))
+    return found
+
+
+def report_laya_shadow(events):
+    """Run laya without letting it decide anything; print where it disagrees.
+
+    Called after the LLM method has filled in `matches`. Disagreement runs in
+    both directions -- laya adding a criterion the LLM missed, and laya
+    missing one the LLM found -- with the probability behind each, which is
+    what you need to judge whether the thresholds are right.
+    """
+    verdicts = laya_verdicts(events)
+    found = laya_disagreements(events, verdicts)
+    texts = {c["n"]: c["text"] for c in INTEREST_CRITERIA}
+    print(f"\n[laya-shadow] laya would have classified {len(found)} of "
+          f"{len(events)} event(s) differently:")
+    for event, verdict, added, dropped in found:
+        print(f"  {event.title}" + (f"  ({event.when})" if event.when else ""))
+        for label, numbers in (("+ laya adds ", added), ("- laya drops", dropped)):
+            for n in numbers:
+                p, threshold = verdict.get(n, (None, None))
+                score = f"p={p:.2f} vs {threshold:.2f}" if p is not None else "no score"
+                print(f"      {label} #{n} {texts.get(n, '?')}  [{score}]")
+        if dropped and event.reason:
+            print(f"      (current reason: {event.reason})")
+    print()
+
+
+def classify_events(events, today, week_end, use_llm=True):
+    """Decide high-interest with whichever method classification.method names.
+
+    `use_llm=False` (--no-llm) skips the Ollama/cloud reviewers but still runs
+    laya, which needs no model server and takes minutes, not hours.
+    """
+    if CLASSIFY_METHOD == "laya":
+        try:
+            run_laya_classification(events)
+        except Exception as e:
+            print(f"WARNING: laya failed ({e}). High-interest events are those "
+                  f"the sources flagged themselves.")
+            apply_source_flags(events)
+        return
+
+    if use_llm:
+        run_classification(events, today, week_end)
+    else:
+        apply_source_flags(events)
+        print(f"*** --no-llm: no model called; {len(high_interest(events))} "
+              f"high-interest from source flags alone.")
+
+    if CLASSIFY_METHOD == "shadow":
+        # Shadow must never cost the real run its result.
+        try:
+            report_laya_shadow(events)
+        except Exception as e:
+            print(f"WARNING: laya shadow run failed ({e}). The LLM result "
+                  f"stands unchanged.")
 
 
 def high_interest(events):
@@ -1928,10 +2156,16 @@ def main():
                  "whole pipeline ran. Set it, or use --dry-run, or set "
                  "output.mode to \"html\".")
 
+    if CLASSIFY_METHOD in ("laya", "shadow") and not importlib.util.find_spec("laya"):
+        sys.exit(f'classification.method is "{CLASSIFY_METHOD}" but laya is not '
+                 f'installed -- pip install -r requirements.txt, or set '
+                 f'classification.method to "llm".')
+
     t0 = time.time()
     today = datetime.now().strftime("%A, %B %d, %Y")
     week_start, week_end = week_bounds()
     print(f"Today is {today}")
+    print(f"Classification: {CLASSIFY_METHOD}")
     print(f"Output mode: {OUTPUT_MODE}"
           + ("" if want_email else " (no email this run)"))
 
@@ -1942,15 +2176,8 @@ def main():
         print("No events collected. Nothing to report.")
 
     # --- Classification ---
-    if no_llm:
-        for event in events:
-            event.matches = auto_matches(event)
-            if event.matches:
-                event.reason = "flagged by the source: " + event.free_stuff
-        print(f"*** --no-llm: no model called; {len(high_interest(events))} "
-              f"high-interest from source flags alone.")
-    else:
-        run_classification(events, today, week_end.strftime("%A, %B %d, %Y"))
+    classify_events(events, today, week_end.strftime("%A, %B %d, %Y"),
+                    use_llm=not no_llm)
 
     starred = high_interest(events)
     print(f"[Result] {len(events)} events, {len(starred)} high-interest.")
