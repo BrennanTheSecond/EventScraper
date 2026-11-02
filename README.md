@@ -320,6 +320,74 @@ source collects nothing and prints only `WARNING: <id> returned no events this
 week`. In `web_search` mode only the `name` and `url` are used (the model
 browses them itself).
 
+### Sources with no built-in parser
+
+Those five types only fit pages whose markup someone already wrote a parser for.
+Two more types cover a page that fits none of them, without a model ever being
+put between the site and the event list.
+
+**`auto` — a selector map.** Describe the repeating item and the nodes inside
+it, as data:
+
+```json
+{ "id": "grad_school", "name": "Graduate School Events",
+  "url": "https://graduateschool.vt.edu/events.html",
+  "type": "auto",
+  "selectors": { "item": "li.card", "title": "h3.event-title",
+                 "date": "time", "link": "a[href]",
+                 "location": ".venue", "category": ".kind" },
+  "flag_classes": { "free-food": "FREE FOOD" },
+  "verified": { "items": 24, "captured": "2026-09-16" } }
+```
+
+Only `item` is required; the rest are optional, and a missing node yields an
+empty field rather than an error. Relative links are resolved against the page.
+
+- **`flag_classes`** maps a CSS class on the item to a flag, the same way
+  events.vt.edu's `features_-free-food` is read. Only classes named here become
+  flags — a flag stays a published fact, never an inference, so
+  `auto_match_flags` in `interests.json` keeps working against it.
+- **`verified.items`** is what the map matched when it was written. Record it:
+  when the site is redesigned the run says
+  `selectors.item "li.card" matched nothing, which matched 24 when captured`
+  instead of reporting an empty week, and a count that has collapsed by half
+  warns too. That is the difference between a silent break and a legible one.
+
+An item with no usable title is skipped with a warning naming
+`selectors.title`, rather than having the whole listing item become its title.
+
+**`module` — a parser in its own file**, for a page whose logic a selector map
+cannot express:
+
+```json
+{ "id": "career_rss", "name": "VT Career Center (RSS)",
+  "url": "https://career.vt.edu/events/feed/",
+  "type": "module", "module": "collectors/career_rss.py" }
+```
+
+The path is resolved against the config file's directory, like
+`interests.json` and `sources.json`. The module defines one function:
+
+```python
+def fetch(source, week_start, week_end) -> list[Event]
+```
+
+and is handed this script as `vt` before its body runs, so it should reuse
+`vt.Event`, `vt._get`, `vt._clean`, `vt._parse_dates`, `vt._in_week` and
+`vt._facet_values` rather than reimplement date handling — a per-site module
+inventing its own date regex is the trap this is meant to avoid.
+
+`collectors/career_rss.py` ships as a worked example. It reads career.vt.edu's
+RSS feed, whose `<pubDate>` is the *publishing* date (every item shares one), so
+the event date has to come out of the permalink
+(`/events/2026/11/03/<slug>/`) — logic a selector map has no way to state. It is
+not registered in `sources.json`; add the entry above to enable it.
+
+A module is ordinary Python that lives in git, so it is reviewable and diffable.
+One that is missing, defines no `fetch`, raises, or returns something other than
+`Event` objects costs that one source with a message naming it — the same blast
+radius a bad classification reply gets, not a lost run.
+
 ---
 
 ## Providers

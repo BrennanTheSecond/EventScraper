@@ -386,6 +386,245 @@ def test_career_fair_parsing():
           all(e.source_id == "career_fairs" for e in fall))
 
 
+_CAREER_RSS = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel>
+  <item>
+    <title>Resume Lab Drop-In</title>
+    <link>https://career.vt.edu/events/2026/09/17/resume-lab-drop-in/</link>
+    <pubDate>Wed, 16 Sep 2026 18:01:41 +0000</pubDate>
+    <description><![CDATA[<p>Bring a draft &amp; a question.</p>]]></description>
+  </item>
+  <item>
+    <title>Campus internEXP Information Session</title>
+    <link>https://career.vt.edu/events/2026/11/03/campus-internexp-session/</link>
+    <pubDate>Wed, 16 Sep 2026 18:01:40 +0000</pubDate>
+    <description>Interested in an internship on campus?</description>
+  </item>
+  <item>
+    <title>A page with no date in its permalink</title>
+    <link>https://career.vt.edu/students/handshake/</link>
+    <pubDate>Wed, 16 Sep 2026 18:01:39 +0000</pubDate>
+    <description>not an event permalink</description>
+  </item>
+  <item>
+    <title>Resume Lab Drop-In</title>
+    <link>https://career.vt.edu/events/2026/09/17/resume-lab-drop-in/</link>
+    <pubDate>Wed, 16 Sep 2026 18:00:00 +0000</pubDate>
+    <description>the same event listed twice</description>
+  </item>
+</channel></rss>
+"""
+
+# A page nobody has written a parser for, described by a selector map instead.
+_AUTO_HTML = """
+<ul class="listing">
+  <li class="card free-food">
+    <h3 class="t">Pizza and Pathways</h3>
+    <time class="d">September 17, 2026</time>
+    <span class="where">Squires 236</span>
+    <span class="cat">Workshop</span>
+    <a href="/events/pizza-and-pathways">details</a>
+  </li>
+  <li class="card">
+    <h3 class="t">Graduate Research Symposium</h3>
+    <time class="d">September 19, 2026</time>
+    <span class="where">Moss Arts Center</span>
+    <span class="cat">Research</span>
+    <a href="https://graduateschool.vt.edu/symposium.html">details</a>
+  </li>
+  <li class="card">
+    <h3 class="t">Winter Commencement</h3>
+    <time class="d">December 18, 2026</time>
+    <a href="/events/winter-commencement">details</a>
+  </li>
+  <li class="card">
+    <a href="/events/blob">September 18, 2026 an item whose only text is its own link</a>
+  </li>
+</ul>
+"""
+
+_AUTO_SELECTORS = {"item": "li.card", "title": "h3.t", "date": "time.d",
+                   "link": "a[href]", "location": ".where", "category": ".cat"}
+
+
+def _auto_source(**over):
+    source = {"id": "grad_school", "name": "Graduate School Events",
+              "url": "https://graduateschool.vt.edu/events.html",
+              "type": "auto", "selectors": dict(_AUTO_SELECTORS),
+              "flag_classes": {"free-food": "FREE FOOD"},
+              "verified": {"items": 4}}
+    source.update(over)
+    return source
+
+
+def _run_collector(fn, source, html, ws=date(2026, 9, 14), we=date(2026, 9, 20)):
+    """Call a collector with the network replaced, capturing what it printed."""
+    import io, contextlib
+    real_get = vt._get
+    vt._get = lambda url, as_json=False: html
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            found = fn(source, ws, we)
+    finally:
+        vt._get = real_get
+    return found, buf.getvalue()
+
+
+def test_module_collector():
+    section('type: "module" -- a per-site parser in its own file')
+    source = {"id": "career_rss", "name": "VT Career Center (RSS)",
+              "url": "https://career.vt.edu/events/feed/",
+              "type": "module", "module": "collectors/career_rss.py"}
+    found, out = _run_collector(vt.fetch_module, source, _CAREER_RSS)
+
+    titles = [e.title for e in found]
+    check("the module is loaded and its events collected",
+          titles == ["Resume Lab Drop-In"], f"got {titles} / {out}")
+    if not found:
+        return
+    event = found[0]
+    check("the date comes from the permalink, not pubDate",
+          event.dates == [date(2026, 9, 17)],
+          "every item in the live feed shares one pubDate")
+    check("an out-of-week item is dropped",
+          "Campus internEXP Information Session" not in titles)
+    check("an item whose permalink carries no date is dropped",
+          "A page with no date in its permalink" not in titles)
+    check("the same permalink twice yields one event", len(found) == 1)
+    check("the description is unescaped and de-tagged",
+          event.description == "Bring a draft & a question.", event.description)
+    check("the module reached back for vt.Event", isinstance(event, vt.Event))
+    check("the source id is carried through", event.source_id == "career_rss")
+
+
+def test_module_loader_failures():
+    section('type: "module" -- a bad module is one missing source, not a crash')
+    import os, tempfile
+    tmp = tempfile.mkdtemp()
+    real_dir, vt.CONFIG_DIR = vt.CONFIG_DIR, tmp
+
+    def write(name, body):
+        with open(os.path.join(tmp, name), "w", encoding="utf-8") as fh:
+            fh.write(body)
+        return {"id": name[:-3], "url": "http://x", "type": "module",
+                "module": name}
+
+    try:
+        found, out = _run_collector(
+            vt.fetch_module, {"id": "nopath", "url": "http://x",
+                              "type": "module"}, "")
+        check("a source with no module path is skipped with a message",
+              found == [] and "module" in out, out.strip())
+
+        found, out = _run_collector(
+            vt.fetch_module, {"id": "missing", "url": "http://x",
+                              "type": "module", "module": "not_here.py"}, "")
+        check("a missing file names the path it looked for",
+              found == [] and "not_here.py" in out, out.strip())
+
+        found, out = _run_collector(
+            vt.fetch_module, write("no_fetch.py", "X = 1\n"), "")
+        check("a module with no fetch() says so",
+              found == [] and "fetch" in out, out.strip())
+
+        found, out = _run_collector(vt.fetch_module, write(
+            "raises.py", "def fetch(source, ws, we):\n    raise ValueError('boom')\n"), "")
+        check("a module that raises is caught and named",
+              found == [] and "ValueError" in out and "boom" in out, out.strip())
+
+        found, out = _run_collector(vt.fetch_module, write(
+            "not_a_list.py", "def fetch(source, ws, we):\n    return {'a': 1}\n"), "")
+        check("a module returning a non-list is rejected",
+              found == [] and "not a list" in out, out.strip())
+
+        found, out = _run_collector(vt.fetch_module, write(
+            "junk.py",
+            "def fetch(source, ws, we):\n"
+            "    return ['a string', vt.Event(title=''), vt.Event(title='Real')]\n"), "")
+        check("non-Event and untitled entries are dropped, the good one kept",
+              [e.title for e in found] == ["Real"], f"{found} / {out}")
+        check("the drops are reported", out.count("WARNING") == 2, out.strip())
+        check("a module that forgot source_id has it filled in",
+              found and found[0].source_id == "junk", found[0].source_id if found else "")
+    finally:
+        vt.CONFIG_DIR = real_dir
+
+
+def test_auto_collector():
+    section('type: "auto" -- a selector map instead of a parser')
+    real_undated, vt.INCLUDE_UNDATED = vt.INCLUDE_UNDATED, True
+    try:
+        found, out = _run_collector(vt.fetch_auto, _auto_source(), _AUTO_HTML)
+    finally:
+        vt.INCLUDE_UNDATED = real_undated
+
+    titles = [e.title for e in found]
+    check("in-week items are collected from the map",
+          titles == ["Pizza and Pathways", "Graduate Research Symposium"],
+          f"got {titles} / {out}")
+    if len(found) < 2:
+        return
+    pizza, symposium = found
+    check("a class named in flag_classes becomes a flag",
+          pizza.flags == ["FREE FOOD"], str(pizza.flags))
+    check("a class not named in flag_classes is not inferred",
+          symposium.flags == [], str(symposium.flags))
+    check("the date selector feeds the week filter",
+          pizza.dates == [date(2026, 9, 17)], str(pizza.dates))
+    check("an out-of-week item is dropped",
+          "Winter Commencement" not in titles)
+    check("a relative href resolves against the page",
+          pizza.link == "https://graduateschool.vt.edu/events/pizza-and-pathways",
+          pizza.link)
+    check("an absolute href is left alone",
+          symposium.link == "https://graduateschool.vt.edu/symposium.html")
+    check("the location selector fills the location",
+          pizza.location == "Squires 236", pizza.location)
+    check("the category selector fills the category",
+          pizza.category == "Workshop", pizza.category)
+    check("an item with no title node of its own is skipped, not titled with "
+          "its whole text",
+          not any("only text is its own link" in t for t in titles),
+          "this is the career_vt text[:160] bug, generalised")
+    check("skipping it names the selector that found nothing",
+          "selectors.title" in out, out.strip())
+
+
+def test_auto_collector_drift():
+    section('type: "auto" -- the map records what it matched, so drift is loud')
+    found, out = _run_collector(
+        vt.fetch_auto, _auto_source(), "<ul><li class='other'>redesigned</li></ul>")
+    check("a map that matches nothing collects nothing", found == [])
+    check("the warning names the selector", "li.card" in out, out.strip())
+    check("the warning names the count it used to match",
+          "4 when captured" in out, out.strip())
+
+    found, out = _run_collector(
+        vt.fetch_auto, _auto_source(verified={"items": 40}), _AUTO_HTML)
+    check("a collapse in item count warns even when some still match",
+          "down from 40" in out, out.strip())
+    check("the events are still collected", len(found) == 2)
+
+    found, out = _run_collector(
+        vt.fetch_auto, _auto_source(verified={}),
+        "<ul><li class='card'><h3 class='t'>No date here</h3>"
+        "<time class='d'>soon</time><a href='/x'>x</a></li></ul>")
+    check("a date selector that parses no date at all warns",
+          "parsed no date" in out, out.strip())
+    check("a source with no selectors.item is skipped with a message",
+          _run_collector(vt.fetch_auto, _auto_source(selectors={}),
+                         _AUTO_HTML)[0] == [])
+
+
+def test_collector_registry():
+    section("_COLLECTORS -- the new types are registered")
+    for name in ("auto", "module"):
+        check(f'type "{name}" resolves to a collector',
+              callable(vt._COLLECTORS.get(name)))
+    check("the hand-written types are untouched",
+          all(callable(vt._COLLECTORS.get(n)) for n in
+              ("events_vt", "career_vt", "career_fairs", "gobblerconnect", "news")))
 # Four real li.event-page items from https://events.vt.edu/events/2026.html,
 # captured 2026-09-16, with the image/srcset wrappers cut out. The class
 # attributes are verbatim: they are the authoritative facets the parser reads,
@@ -578,6 +817,116 @@ def test_config_json_errors():
         check("the message names the key", '"sources" key' in str(e), str(e))
 
 
+class _FakeLaya:
+    """Stands in for a laya checkpoint: P(yes) comes from a table keyed on
+    (a word in the event title, question id), 0.1 otherwise."""
+
+    def __init__(self, table):
+        self.table = table
+        self.calls = []
+
+    def predict_batch(self, states, schema, batch_size=None):
+        self.calls.append(sorted(schema))
+        results = []
+        for state in states:
+            answers = {}
+            for qid in schema:
+                p = next((p for (word, q), p in self.table.items()
+                          if q == qid and word in state), 0.1)
+                answers[qid] = {"type": "noul", "noul": p}
+            results.append({"answers": answers})
+        return results
+
+
+def _with_laya(method, table):
+    """Point both classifiers at one fake checkpoint and return it."""
+    fake = _FakeLaya(table)
+    vt._LAYA_AGENTS.clear()
+    vt._LAYA_AGENTS["english"] = fake
+    vt.CLASSIFY_METHOD = method
+    vt.LAYA_FREE = dict(vt.LAYA_FREE_DEFAULTS)
+    vt.LAYA_INTERESTS = dict(vt.LAYA_INTERESTS_DEFAULTS)
+    return fake
+
+
+def test_laya_classifiers():
+    section("laya -- two classifiers, thresholded, unioned with source flags")
+    clfs = vt.laya_classifiers()
+    check("free and interests are separate classifiers",
+          [c.label for c in clfs] == ["laya-free", "laya-interests"])
+    check("the free classifier answers only the auto_match_flags criterion",
+          list(clfs[0].questions) == [1])
+    check("the interests classifier answers every other criterion",
+          list(clfs[1].questions) == [2, 3, 4])
+    check("each interest question names its criterion",
+          "Fencing" in clfs[1].questions[3], clfs[1].questions[3])
+
+    fake = _with_laya("laya", {("Pizza", "c1"): 0.8, ("Fencing", "c3"): 0.49,
+                               ("Python", "c4"): 0.5})
+    events = [vt.Event(title="Pizza Social"), vt.Event(title="Open Fencing"),
+              vt.Event(title="Python Workshop"),
+              vt.Event(title="Giveaway Table", flags=["FREE ITEMS / GIVEAWAYS"])]
+    vt.classify_events(events, "today", "sunday")
+    check("each classifier is one batched call",
+          fake.calls == [["c1"], ["c2", "c3", "c4"]], fake.calls)
+    check("above threshold matches", events[0].matches == [1], events[0].matches)
+    check("the reason carries laya's probability",
+          events[0].reason == "laya: #1 p=0.80", events[0].reason)
+    check("just below threshold does not", events[1].matches == [], events[1].matches)
+    check("exactly at threshold does", events[2].matches == [4], events[2].matches)
+    check("source flags still match with laya unsure",
+          events[3].matches == [1] and events[3].reason.startswith("flagged"),
+          (events[3].matches, events[3].reason))
+
+    vt.LAYA_INTERESTS["threshold"] = 0.4
+    vt.classify_events(events, "today", "sunday")
+    check("the interests threshold is its own setting",
+          events[1].matches == [3] and events[0].matches == [1])
+
+
+def test_laya_shadow():
+    section("laya shadow -- the LLM result stands, disagreements are printed")
+    _with_laya("shadow", {("Pizza", "c1"): 0.9})
+    events = [vt.Event(title="Pizza Social"), vt.Event(title="Fencing Bout"),
+              vt.Event(title="Quiet Event")]
+
+    def fake_llm(evs, today, week_end):
+        vt.apply_source_flags(evs)
+        evs[1].matches, evs[1].reason = [3], "fencing"
+
+    real, vt.run_classification = vt.run_classification, fake_llm
+    import contextlib, io
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out):
+            vt.classify_events(events, "today", "sunday")
+    finally:
+        vt.run_classification = real
+    printed = out.getvalue()
+    check("shadow does not change the LLM's matches",
+          [e.matches for e in events] == [[], [3], []])
+    check("an addition laya would make is printed",
+          "Pizza Social" in printed and "+ laya adds  #1" in printed, printed)
+    check("a match laya would drop is printed, with the LLM's reason",
+          "- laya drops #3" in printed and "current reason: fencing" in printed, printed)
+    check("agreement is not printed", "Quiet Event" not in printed)
+    check("the count is right", "differently" in printed and " 2 of 3 " in printed, printed)
+
+    def broken(name):
+        raise RuntimeError("no network")
+
+    real_agent, vt._laya_agent = vt._laya_agent, broken
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            vt.classify_events(events, "today", "sunday", use_llm=False)
+        check("a laya failure in shadow mode is not fatal", True)
+    except Exception as e:
+        check("a laya failure in shadow mode is not fatal", False, str(e))
+    finally:
+        vt._laya_agent = real_agent
+    vt.CLASSIFY_METHOD = "llm"
+
+
 if __name__ == "__main__":
     for test in (test_parse_classification, test_dedupe, test_auto_matches,
                  test_permanent_errors, test_thinking_fallback,
@@ -586,9 +935,13 @@ if __name__ == "__main__":
                  test_escaping, test_scrape_roundtrip, test_email_bodies,
                  test_criteria_normalization,
                  test_career_fair_dates, test_career_fair_parsing,
+                 test_module_collector, test_module_loader_failures,
+                 test_auto_collector, test_auto_collector_drift,
+                 test_collector_registry,
                  test_events_vt_listing_urls, test_events_vt_parsing,
                  test_events_vt_selector_miss,
-                 test_config_json_errors):
+                 test_config_json_errors,
+                 test_laya_classifiers, test_laya_shadow):
         test()
 
     print()
