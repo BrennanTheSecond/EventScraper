@@ -33,6 +33,23 @@
     "cloud_timeout_seconds": 180,
     "max_tokens": 8192
   },
+  "classification": {
+    "method": "llm",
+    "_note": "method: \"llm\" uses the worker/judge model pipeline (the original method). \"laya\" uses the two laya classifiers instead (free things + interests; no Ollama needed, ~2 min on CPU). \"shadow\" runs the llm method for real and laya alongside it, printing to the console every event where laya would have disagreed."
+  },
+  "laya": {
+    "device": "cpu",
+    "batch_size": 16,
+    "free": {
+      "model": "english",
+      "threshold": 0.5
+    },
+    "interests": {
+      "model": "english",
+      "threshold": 0.5
+    },
+    "_note": "model: a laya checkpoint name (english, multilingual, typed-decisions) or a Hugging Face repo / local path to a fine-tuned one. threshold: P(yes) at or above which a criterion matches. free answers the interests.json criterion with auto_match_flags; interests answers the rest. Optional \"question\" overrides the question text ({criterion} is substituted for interests)."
+  },
   "scraping": {
     "mode": "builtin",
     "http_timeout": 20,
