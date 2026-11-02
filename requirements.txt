@@ -5,3 +5,9 @@ ollama
 google-genai
 openai
 anthropic
+
+# laya classifier (classification.method "laya" or "shadow"). The extra index
+# makes pip pick the CPU-only torch build -- the default CUDA wheels are ~2 GB
+# larger and useless on this box.
+--extra-index-url https://download.pytorch.org/whl/cpu
+laya

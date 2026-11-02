@@ -651,6 +651,116 @@ def test_config_json_errors():
         check("the message names the key", '"sources" key' in str(e), str(e))
 
 
+class _FakeLaya:
+    """Stands in for a laya checkpoint: P(yes) comes from a table keyed on
+    (a word in the event title, question id), 0.1 otherwise."""
+
+    def __init__(self, table):
+        self.table = table
+        self.calls = []
+
+    def predict_batch(self, states, schema, batch_size=None):
+        self.calls.append(sorted(schema))
+        results = []
+        for state in states:
+            answers = {}
+            for qid in schema:
+                p = next((p for (word, q), p in self.table.items()
+                          if q == qid and word in state), 0.1)
+                answers[qid] = {"type": "noul", "noul": p}
+            results.append({"answers": answers})
+        return results
+
+
+def _with_laya(method, table):
+    """Point both classifiers at one fake checkpoint and return it."""
+    fake = _FakeLaya(table)
+    vt._LAYA_AGENTS.clear()
+    vt._LAYA_AGENTS["english"] = fake
+    vt.CLASSIFY_METHOD = method
+    vt.LAYA_FREE = dict(vt.LAYA_FREE_DEFAULTS)
+    vt.LAYA_INTERESTS = dict(vt.LAYA_INTERESTS_DEFAULTS)
+    return fake
+
+
+def test_laya_classifiers():
+    section("laya -- two classifiers, thresholded, unioned with source flags")
+    clfs = vt.laya_classifiers()
+    check("free and interests are separate classifiers",
+          [c.label for c in clfs] == ["laya-free", "laya-interests"])
+    check("the free classifier answers only the auto_match_flags criterion",
+          list(clfs[0].questions) == [1])
+    check("the interests classifier answers every other criterion",
+          list(clfs[1].questions) == [2, 3, 4])
+    check("each interest question names its criterion",
+          "Fencing" in clfs[1].questions[3], clfs[1].questions[3])
+
+    fake = _with_laya("laya", {("Pizza", "c1"): 0.8, ("Fencing", "c3"): 0.49,
+                               ("Python", "c4"): 0.5})
+    events = [vt.Event(title="Pizza Social"), vt.Event(title="Open Fencing"),
+              vt.Event(title="Python Workshop"),
+              vt.Event(title="Giveaway Table", flags=["FREE ITEMS / GIVEAWAYS"])]
+    vt.classify_events(events, "today", "sunday")
+    check("each classifier is one batched call",
+          fake.calls == [["c1"], ["c2", "c3", "c4"]], fake.calls)
+    check("above threshold matches", events[0].matches == [1], events[0].matches)
+    check("the reason carries laya's probability",
+          events[0].reason == "laya: #1 p=0.80", events[0].reason)
+    check("just below threshold does not", events[1].matches == [], events[1].matches)
+    check("exactly at threshold does", events[2].matches == [4], events[2].matches)
+    check("source flags still match with laya unsure",
+          events[3].matches == [1] and events[3].reason.startswith("flagged"),
+          (events[3].matches, events[3].reason))
+
+    vt.LAYA_INTERESTS["threshold"] = 0.4
+    vt.classify_events(events, "today", "sunday")
+    check("the interests threshold is its own setting",
+          events[1].matches == [3] and events[0].matches == [1])
+
+
+def test_laya_shadow():
+    section("laya shadow -- the LLM result stands, disagreements are printed")
+    _with_laya("shadow", {("Pizza", "c1"): 0.9})
+    events = [vt.Event(title="Pizza Social"), vt.Event(title="Fencing Bout"),
+              vt.Event(title="Quiet Event")]
+
+    def fake_llm(evs, today, week_end):
+        vt.apply_source_flags(evs)
+        evs[1].matches, evs[1].reason = [3], "fencing"
+
+    real, vt.run_classification = vt.run_classification, fake_llm
+    import contextlib, io
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out):
+            vt.classify_events(events, "today", "sunday")
+    finally:
+        vt.run_classification = real
+    printed = out.getvalue()
+    check("shadow does not change the LLM's matches",
+          [e.matches for e in events] == [[], [3], []])
+    check("an addition laya would make is printed",
+          "Pizza Social" in printed and "+ laya adds  #1" in printed, printed)
+    check("a match laya would drop is printed, with the LLM's reason",
+          "- laya drops #3" in printed and "current reason: fencing" in printed, printed)
+    check("agreement is not printed", "Quiet Event" not in printed)
+    check("the count is right", "differently" in printed and " 2 of 3 " in printed, printed)
+
+    def broken(name):
+        raise RuntimeError("no network")
+
+    real_agent, vt._laya_agent = vt._laya_agent, broken
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            vt.classify_events(events, "today", "sunday", use_llm=False)
+        check("a laya failure in shadow mode is not fatal", True)
+    except Exception as e:
+        check("a laya failure in shadow mode is not fatal", False, str(e))
+    finally:
+        vt._laya_agent = real_agent
+    vt.CLASSIFY_METHOD = "llm"
+
+
 if __name__ == "__main__":
     for test in (test_parse_classification, test_dedupe, test_auto_matches,
                  test_permanent_errors, test_thinking_fallback,
@@ -662,7 +772,8 @@ if __name__ == "__main__":
                  test_module_collector, test_module_loader_failures,
                  test_auto_collector, test_auto_collector_drift,
                  test_collector_registry,
-                 test_config_json_errors):
+                 test_config_json_errors,
+                 test_laya_classifiers, test_laya_shadow):
         test()
 
     print()
