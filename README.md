@@ -1,5 +1,7 @@
 # EventScraper (VT Event Reminders)
 
+> Originally designed for Virginia Tech campus events, but built to be general enough to scrape and filter events from almost any source.
+
 Scrapes Virginia Tech event/notice pages and GobblerConnect into structured
 records, asks an LLM which of them match your interests, writes a local HTML
 report, and emails the matches via Gmail SMTP.
@@ -26,6 +28,16 @@ the digest costs nothing.
 
 Supported providers: **Ollama** (local/free), **Gemini**, **Claude**
 (Anthropic), and **OpenAI**.
+
+
+## Screenshots
+
+The HTML report, grouped by day, with matches highlighted and tagged by interest:
+
+<p>
+  <img src="docs/report-desktop.png" alt="Desktop view of the event report" width="640">
+  <img src="docs/report-mobile.png" alt="Mobile view of the event report" width="200">
+</p>
 
 ---
 
